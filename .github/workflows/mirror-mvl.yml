@@ -1,0 +1,36 @@
+name: Mirror mvl-boston branches
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours
+  workflow_dispatch:         # also allow manual runs from the Actions tab
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout your fork (master)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "mvl-mirror-bot"
+          git config user.email "mirror-bot@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/mvl-boston/openpilot.git
+          git fetch upstream --prune
+
+      - name: Mirror mvl branches into your fork
+        run: |
+          for branch in sp-honda-dev-202604; do
+            echo "::group::Mirroring $branch"
+            git push origin "refs/remotes/upstream/${branch}:refs/heads/${branch}" --force-with-lease
+            echo "::endgroup::"
+          done
