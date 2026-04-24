@@ -25,7 +25,7 @@ jobs:
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/mvl-boston/openpilot.git
-          git fetch upstream --prune
+          git fetch upstream sp-honda-dev-202604 --no-tags
 
       - name: Mirror mvl branches into your fork
         run: |
