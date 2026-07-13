@@ -1,0 +1,27 @@
+name: Mirror mvl-boston sp-honda-dev-202606 (exact)
+on:
+  schedule:
+    - cron: '15 10 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sp-honda-202606-mirror
+          fetch-depth: 0
+
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add mvl https://github.com/mvl-boston/openpilot.git || true
+          git fetch mvl sp-honda-dev-202606
+
+      - run: git reset --hard mvl/sp-honda-dev-202606
+
+      - name: Push (skip LFS binary push, GitLab remote is unreachable from here)
+        env:
+          GIT_LFS_SKIP_PUSH: "1"
+        run: git push origin sp-honda-202606-mirror --force-with-lease
