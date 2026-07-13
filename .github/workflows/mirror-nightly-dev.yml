@@ -1,0 +1,43 @@
+name: Mirror nightly-dev + brake-request fix
+on:
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: nightly-dev-mirror
+          fetch-depth: 0
+
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/commaai/openpilot.git || true
+          git fetch upstream nightly-dev
+
+      - id: rebase
+        run: |
+          if git rebase upstream/nightly-dev; then
+            echo "success=true" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "success=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.rebase.outputs.success == 'true'
+        run: git push origin nightly-dev-mirror --force-with-lease
+
+      - if: steps.rebase.outputs.success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'nightly-dev-mirror rebase conflict',
+              body: 'Auto-rebase onto commaai/openpilot nightly-dev failed — likely a conflict with the brake_request fix in opendbc_repo/opendbc (dbc/generator/honda/honda_bosch_radarless.dbc or car/honda/hondacan.py). Resolve manually: cd into the nightly-dev-mirror worktree, git fetch upstream nightly-dev, git rebase upstream/nightly-dev, resolve, git push --force-with-lease.'
+            })
