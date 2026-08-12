@@ -1,0 +1,61 @@
+name: Mirror mvl-boston sp-honda-dev-202608 + MPC lead toggle
+on:
+  schedule:
+    - cron: '30 10 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Stash the toggle patch outside the repo (we're about to switch trees)
+        run: cp .github/patches/mpc-lead-trajectory-toggle.patch /tmp/mpc-lead-trajectory-toggle.patch
+
+      - name: Fetch mvl-boston's current branch and reset onto it
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add mvl https://github.com/mvl-boston/openpilot.git || true
+          git fetch mvl sp-honda-dev-202608 --no-tags
+          git checkout -B sp-honda-dev-202608-mpc-toggle mvl/sp-honda-dev-202608
+
+      - id: patch
+        name: Reapply the MpcLeadTrajectory toggle on top
+        run: |
+          if git am /tmp/mpc-lead-trajectory-toggle.patch; then
+            echo "success=true" >> "$GITHUB_OUTPUT"
+          else
+            git am --abort || true
+            echo "success=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.patch.outputs.success == 'true'
+        name: Push (skip LFS binary push, GitLab remote is unreachable from here)
+        env:
+          GIT_LFS_SKIP_PUSH: "1"
+        run: git push origin sp-honda-dev-202608-mpc-toggle --force-with-lease
+
+      - if: steps.patch.outputs.success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'sp-honda-dev-202608-mpc-toggle: MpcLeadTrajectory patch no longer applies',
+              body: 'mvl-boston/openpilot sp-honda-dev-202608 changed in a way that conflicts with ' +
+                    '.github/patches/mpc-lead-trajectory-toggle.patch (long_mpc.py / longitudinal_planner.py / ' +
+                    'both developer.py layouts / params_keys.h / log.capnp). Resolve manually: git fetch mvl ' +
+                    'sp-honda-dev-202608, git checkout -B sp-honda-dev-202608-mpc-toggle mvl/sp-honda-dev-202608, ' +
+                    'git am .github/patches/mpc-lead-trajectory-toggle.patch, fix conflicts, git am --continue, ' +
+                    'then on the branch carrying the toggle source changes regenerate the patch with ' +
+                    '`git format-patch -1 HEAD --stdout > .github/patches/mpc-lead-trajectory-toggle.patch`, ' +
+                    'and push --force-with-lease.'
+            })

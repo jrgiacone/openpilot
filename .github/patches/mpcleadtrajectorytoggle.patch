@@ -1,0 +1,287 @@
+From a71495a10a3c03df86f46d723f82e62774ddd674 Mon Sep 17 00:00:00 2001
+From: Joshua Giacone <giaconejoshua@gmail.com>
+Date: Wed, 12 Aug 2026 14:51:29 +0000
+Subject: [PATCH] add MpcLeadTrajectory dev-menu toggle for model-predicted
+ lead trajectory
+
+Ports commaai/openpilot#37824 (draft, "long mpc: use model predicted lead
+trajectory") as an opt-in toggle instead of a blanket replacement, following
+the same pattern as SPLC (LaneCentering param + toggle_item_sp/BigParamControl
+in both developer-menu layouts).
+
+When off (default): unchanged legacy kinematic lead extrapolation from radar
+state (process_lead_legacy), CRUISE_MAX_ACCEL stays 1.6.
+
+When on: MPC plans against the driving model's full predicted lead trajectory
+(0-10s, leadsV3) anchored to the radar's h=0 measurement, letting it react
+earlier to a lead braking hard for a stop and ignore brief spurious slowdowns.
+Pairs with a higher CRUISE_MAX_ACCEL_MODEL_LEAD (2.0) since the smarter lead
+sensing affords a snappier response. Toggle state is polled on the same
+PARAMS_UPDATE_PERIOD cadence sunnypilot uses elsewhere for realtime params.
+
+Adds leadTrajectoryX0/V0/X1/V1 to LongitudinalPlan for logging/debugging
+regardless of toggle state.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ openpilot/cereal/log.capnp                    |  7 ++
+ openpilot/common/params_keys.h                |  1 +
+ .../lib/longitudinal_mpc_lib/long_mpc.py      | 67 +++++++++++++++++--
+ .../controls/lib/longitudinal_planner.py      | 12 +++-
+ .../ui/mici/layouts/settings/developer.py     |  3 +
+ .../sunnypilot/layouts/settings/developer.py  |  8 ++-
+ 6 files changed, 88 insertions(+), 10 deletions(-)
+
+diff --git a/openpilot/cereal/log.capnp b/openpilot/cereal/log.capnp
+index 1eaaa30..0112c14 100644
+--- a/openpilot/cereal/log.capnp
++++ b/openpilot/cereal/log.capnp
+@@ -1214,6 +1214,13 @@ struct LongitudinalPlan @0xe00b5b3eba12876c {
+ 
+   solverExecutionTime @35 :Float32;
+ 
++  # lead trajectories the MPC solved against (13 points at T_IDXS); only meaningful
++  # when MpcLeadTrajectory is on, otherwise these mirror the legacy kinematic extrapolation
++  leadTrajectoryX0 @40 :List(Float32);
++  leadTrajectoryV0 @41 :List(Float32);
++  leadTrajectoryX1 @42 :List(Float32);
++  leadTrajectoryV1 @43 :List(Float32);
++
+   enum LongitudinalPlanSource {
+     cruise @0;
+     lead0 @1;
+diff --git a/openpilot/common/params_keys.h b/openpilot/common/params_keys.h
+index ba33b3b..a5c54de 100644
+--- a/openpilot/common/params_keys.h
++++ b/openpilot/common/params_keys.h
+@@ -175,6 +175,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
+     {"LeadDepartAlert", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"MaxTimeOffroad", {PERSISTENT | BACKUP, INT, "1800"}},
+     {"ModelRunnerTypeCache", {CLEAR_ON_ONROAD_TRANSITION, INT}},
++    {"MpcLeadTrajectory", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"OffroadMode", {CLEAR_ON_MANAGER_START, BOOL}},
+     {"Offroad_TiciSupport", {CLEAR_ON_MANAGER_START, JSON}},
+     {"OnroadScreenOffBrightness", {PERSISTENT | BACKUP, INT, "0"}},
+diff --git a/openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py b/openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py
+index de1ba0c..0260a7f 100755
+--- a/openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py
++++ b/openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py
+@@ -6,10 +6,14 @@ from openpilot.cereal import log
+ from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
+ from openpilot.common.realtime import DT_MDL
+ from openpilot.common.swaglog import cloudlog
++from openpilot.common.params import Params
++from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
+ # WARNING: imports outside of constants will not trigger a rebuild
+-from openpilot.selfdrive.modeld.constants import index_function
++from openpilot.selfdrive.modeld.constants import index_function, ModelConstants
+ from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
+ 
++LEAD_T_IDXS_MODEL = np.array(ModelConstants.LEAD_T_IDXS)  # [0, 2, 4, 6, 8, 10]s
++
+ if __name__ == '__main__':  # generating code
+   from acados.acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
+ else:
+@@ -57,6 +61,10 @@ COMFORT_BRAKE = 2.5
+ STOP_DISTANCE = 6.0
+ CRUISE_MIN_ACCEL = -1.2
+ CRUISE_MAX_ACCEL = 1.6
++# Only used when MpcLeadTrajectory is on: the model-predicted-lead path anticipates the lead's
++# future deceleration rather than extrapolating from its current state, so a snappier cruise
++# accel limit is safe to pair with it.
++CRUISE_MAX_ACCEL_MODEL_LEAD = 2.0
+ MIN_X_LEAD_FACTOR = 0.5
+ 
+ def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
+@@ -217,9 +225,17 @@ class LongitudinalMpc:
+   def __init__(self, dt=DT_MDL):
+     self.dt = dt
+     self.solver = AcadosOcpSolverCython(MODEL_NAME, ACADOS_SOLVER_TYPE, N)
++    self._params_store = Params()
++    self.use_model_lead_trajectory = self._params_store.get_bool("MpcLeadTrajectory")
++    self._param_update_time = 0.0
+     self.reset()
+     self.source = LongitudinalPlanSource.cruise
+ 
++  def update_toggle_params(self):
++    if time.monotonic() - self._param_update_time > PARAMS_UPDATE_PERIOD:
++      self.use_model_lead_trajectory = self._params_store.get_bool("MpcLeadTrajectory")
++      self._param_update_time = time.monotonic()
++
+   def reset(self):
+     self.solver.reset()
+ 
+@@ -245,6 +261,8 @@ class LongitudinalMpc:
+     # timers
+     self.solve_time = 0.0
+     self.x0 = np.zeros(X_DIM)
++    self.lead_xv_0 = np.zeros((N+1, 2))
++    self.lead_xv_1 = np.zeros((N+1, 2))
+     self.set_weights()
+ 
+   def set_cost_weights(self, cost_weights, constraint_cost_weights):
+@@ -286,7 +304,7 @@ class LongitudinalMpc:
+     lead_xv = np.column_stack((x_lead_traj, v_lead_traj))
+     return lead_xv
+ 
+-  def process_lead(self, lead):
++  def process_lead_legacy(self, lead):
+     v_ego = self.x0[1]
+     if lead is not None and lead.present:
+       x_lead = lead.dRel
+@@ -309,12 +327,46 @@ class LongitudinalMpc:
+     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
+     return lead_xv
+ 
+-  def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard):
++  def process_lead_model_trajectory(self, model_lead, radar_lead):
++    v_ego = self.x0[1]
++    if model_lead.prob > 0.5 and radar_lead is not None and radar_lead.present:
++      # Anchor at radar's trusted h=0, use model's delta for h>0. On radarless, radarState
++      # is synthesized from the model (radard.get_RadarState_from_vision), so this collapses
++      # to `x - RADAR_TO_CAMERA` and `v_ego + (model.v - model_v_ego)` — identical to the
++      # prior formula. On radar cars, real radar measurements anchor the trajectory.
++      x_lead_traj = float(radar_lead.dRel) + (np.asarray(model_lead.x, dtype=np.float64) - model_lead.x[0])
++      v_lead_traj = float(radar_lead.vLead) + (np.asarray(model_lead.v, dtype=np.float64) - model_lead.v[0])
++    else:
++      # Fake a fast lead so MPC stays in the same mode.
++      x_lead_traj = 50.0 + (v_ego + 10.0) * LEAD_T_IDXS_MODEL
++      v_lead_traj = np.full_like(LEAD_T_IDXS_MODEL, v_ego + 10.0)
++
++    # MPC won't converge on immediate crashes; lift h=0 to the minimum braking distance.
++    v_lead_0 = v_lead_traj[0]
++    min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead_0) * (v_ego - v_lead_0) / (-ACCEL_MIN * 2)
++    x_lead_traj[0] = max(x_lead_traj[0], min_x_lead)
++    v_lead_traj = np.clip(v_lead_traj, 0.0, 1e8)
++
++    x_lead_mpc = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead_traj))
++    v_lead_mpc = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead_traj)
++    return np.column_stack((x_lead_mpc, v_lead_mpc))
++
++  def update(self, radarstate, modelV2, v_cruise, personality=log.LongitudinalPersonality.standard):
++    self.update_toggle_params()
+     t_follow = get_T_FOLLOW(personality)
+     v_ego = self.x0[1]
+ 
+-    lead_xv_0 = self.process_lead(radarstate.leadOne)
+-    lead_xv_1 = self.process_lead(radarstate.leadTwo)
++    if self.use_model_lead_trajectory:
++      model_leads = modelV2.leadsV3
++      lead_xv_0 = self.process_lead_model_trajectory(model_leads[0], radarstate.leadOne)
++      lead_xv_1 = self.process_lead_model_trajectory(model_leads[1], radarstate.leadTwo)
++      crash_lead_prob = model_leads[0].prob
++    else:
++      lead_xv_0 = self.process_lead_legacy(radarstate.leadOne)
++      lead_xv_1 = self.process_lead_legacy(radarstate.leadTwo)
++      crash_lead_prob = radarstate.leadOne.modelProb
++    self.lead_xv_0 = lead_xv_0
++    self.lead_xv_1 = lead_xv_1
+ 
+     # To estimate a safe distance from a moving lead, we calculate how much stopping
+     # distance that lead needs as a minimum. We can add that to the current distance
+@@ -324,9 +376,10 @@ class LongitudinalMpc:
+ 
+     # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
+     # when the leads are no factor.
++    cruise_max_accel = CRUISE_MAX_ACCEL_MODEL_LEAD if self.use_model_lead_trajectory else CRUISE_MAX_ACCEL
+     v_lower = v_ego + (T_IDXS * CRUISE_MIN_ACCEL * 1.05)
+     # TODO does this make sense when max_a is negative?
+-    v_upper = v_ego + (T_IDXS * CRUISE_MAX_ACCEL * 1.05)
++    v_upper = v_ego + (T_IDXS * cruise_max_accel * 1.05)
+     v_cruise_clipped = np.clip(v_cruise * np.ones(N+1), v_lower, v_upper)
+     cruise_obstacle = np.cumsum(T_DIFFS * v_cruise_clipped) + get_safe_obstacle_distance(v_cruise_clipped, t_follow)
+ 
+@@ -347,7 +400,7 @@ class LongitudinalMpc:
+ 
+     self.run()
+     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and
+-            radarstate.leadOne.modelProb > 0.9):
++            crash_lead_prob > 0.9):
+       self.crash_cnt += 1
+     else:
+       self.crash_cnt = 0
+diff --git a/openpilot/selfdrive/controls/lib/longitudinal_planner.py b/openpilot/selfdrive/controls/lib/longitudinal_planner.py
+index 7e3446a..be3f899 100755
+--- a/openpilot/selfdrive/controls/lib/longitudinal_planner.py
++++ b/openpilot/selfdrive/controls/lib/longitudinal_planner.py
+@@ -119,7 +119,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
+ 
+     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
+     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
+-    self.mpc.update(sm['radarState'], v_cruise, personality=sm['selfdriveState'].personality)
++    self.mpc.update(sm['radarState'], sm['modelV2'], v_cruise, personality=sm['selfdriveState'].personality)
+ 
+     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
+     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
+@@ -169,10 +169,18 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
+     longitudinalPlan.accels = self.a_desired_trajectory.tolist()
+     longitudinalPlan.jerks = self.j_desired_trajectory.tolist()
+ 
+-    longitudinalPlan.hasLead = sm['radarState'].leadOne.present
++    if self.mpc.use_model_lead_trajectory:
++      longitudinalPlan.hasLead = sm['modelV2'].leadsV3[0].prob > 0.5
++    else:
++      longitudinalPlan.hasLead = sm['radarState'].leadOne.present
+     longitudinalPlan.longitudinalPlanSource = self.mpc.source
+     longitudinalPlan.fcw = self.fcw
+ 
++    longitudinalPlan.leadTrajectoryX0 = self.mpc.lead_xv_0[:, 0].tolist()
++    longitudinalPlan.leadTrajectoryV0 = self.mpc.lead_xv_0[:, 1].tolist()
++    longitudinalPlan.leadTrajectoryX1 = self.mpc.lead_xv_1[:, 0].tolist()
++    longitudinalPlan.leadTrajectoryV1 = self.mpc.lead_xv_1[:, 1].tolist()
++
+     longitudinalPlan.aTarget = float(self.output_a_target)
+     longitudinalPlan.shouldStop = bool(self.output_should_stop)
+     longitudinalPlan.allowBrake = True
+diff --git a/openpilot/selfdrive/ui/mici/layouts/settings/developer.py b/openpilot/selfdrive/ui/mici/layouts/settings/developer.py
+index 1375ce3..ee3bf3b 100644
+--- a/openpilot/selfdrive/ui/mici/layouts/settings/developer.py
++++ b/openpilot/selfdrive/ui/mici/layouts/settings/developer.py
+@@ -97,6 +97,7 @@ class DeveloperLayoutMici(NavScroller):
+                                                      select_callback=self._on_lane_center_offset, font_size=40)
+     self._lane_centering_e2e_authority_toggle = BigMultiToggle("SPLC e2e override", list(LANE_CENTERING_E2E_AUTHORITY_LABELS),
+                                                                select_callback=self._on_lane_centering_e2e_authority, font_size=40)
++    self._mpc_lead_trajectory_toggle = BigParamControl("model predicted lead trajectory", "MpcLeadTrajectory")
+ 
+     self._scroller.add_widgets([
+       self._adb_toggle,
+@@ -111,6 +112,7 @@ class DeveloperLayoutMici(NavScroller):
+       self._lane_centering_pause_toggle,
+       self._lane_center_offset_toggle,
+       self._lane_centering_e2e_authority_toggle,
++      self._mpc_lead_trajectory_toggle,
+     ])
+ 
+     # Toggle lists
+@@ -123,6 +125,7 @@ class DeveloperLayoutMici(NavScroller):
+       ("AlphaLongitudinalEnabled", self._alpha_long_toggle),
+       ("ShowDebugInfo", self._debug_mode_toggle),
+       ("LaneCentering", self._lane_centering_toggle),
++      ("MpcLeadTrajectory", self._mpc_lead_trajectory_toggle),
+     )
+     onroad_blocked_toggles = (self._adb_toggle, self._joystick_toggle)
+     release_blocked_toggles = (self._joystick_toggle, self._long_maneuver_toggle, self._lat_maneuver_toggle, self._alpha_long_toggle)
+diff --git a/openpilot/selfdrive/ui/sunnypilot/layouts/settings/developer.py b/openpilot/selfdrive/ui/sunnypilot/layouts/settings/developer.py
+index 820800e..0550842 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/layouts/settings/developer.py
++++ b/openpilot/selfdrive/ui/sunnypilot/layouts/settings/developer.py
+@@ -78,9 +78,15 @@ class DeveloperLayoutSP(DeveloperLayout):
+                                                                value_change_step=5, label_width=style.BUTTON_ACTION_WIDTH, use_float_scaling=True,
+                                                                label_callback=lambda v: f"{v}%")
+ 
++    self.mpc_lead_trajectory_toggle = toggle_item_sp(tr("Model Predicted Lead Trajectory"),
++                                                     tr("Experimental: plan the MPC against the driving model's full predicted lead trajectory " +
++                                                        "(0-10s) instead of extrapolating from the lead's current speed/accel. Intended to react " +
++                                                        "earlier to a lead braking hard for a stop, and ignore brief spurious slowdowns. " +
++                                                        "Ported from comma's draft openpilot PR #37824."), param="MpcLeadTrajectory")
++
+     self.items: list = [self.show_advanced_controls, self.enable_github_runner_toggle, self.enable_copyparty_toggle, self.prebuilt_toggle,
+                         self.error_log_btn, self.lane_centering_toggle, self.lane_centering_pause_toggle,
+-                        self.lane_center_offset_control, self.lane_centering_e2e_authority_control,]
++                        self.lane_center_offset_control, self.lane_centering_e2e_authority_control, self.mpc_lead_trajectory_toggle,]
+ 
+   @staticmethod
+   def _on_slc_pause_on_signal(state):
+-- 
+2.43.0
+
