@@ -78,9 +78,15 @@ class DeveloperLayoutSP(DeveloperLayout):
                                                                value_change_step=5, label_width=style.BUTTON_ACTION_WIDTH, use_float_scaling=True,
                                                                label_callback=lambda v: f"{v}%")
 
+    self.mpc_lead_trajectory_toggle = toggle_item_sp(tr("Model Predicted Lead Trajectory"),
+                                                     tr("Experimental: plan the MPC against the driving model's full predicted lead trajectory " +
+                                                        "(0-10s) instead of extrapolating from the lead's current speed/accel. Intended to react " +
+                                                        "earlier to a lead braking hard for a stop, and ignore brief spurious slowdowns. " +
+                                                        "Ported from comma's draft openpilot PR #37824."), param="MpcLeadTrajectory")
+
     self.items: list = [self.show_advanced_controls, self.enable_github_runner_toggle, self.enable_copyparty_toggle, self.prebuilt_toggle,
                         self.error_log_btn, self.lane_centering_toggle, self.lane_centering_pause_toggle,
-                        self.lane_center_offset_control, self.lane_centering_e2e_authority_control,]
+                        self.lane_center_offset_control, self.lane_centering_e2e_authority_control, self.mpc_lead_trajectory_toggle,]
 
   @staticmethod
   def _on_slc_pause_on_signal(state):

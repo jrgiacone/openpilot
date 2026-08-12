@@ -97,6 +97,7 @@ class DeveloperLayoutMici(NavScroller):
                                                      select_callback=self._on_lane_center_offset, font_size=40)
     self._lane_centering_e2e_authority_toggle = BigMultiToggle("SPLC e2e override", list(LANE_CENTERING_E2E_AUTHORITY_LABELS),
                                                                select_callback=self._on_lane_centering_e2e_authority, font_size=40)
+    self._mpc_lead_trajectory_toggle = BigParamControl("model predicted lead trajectory", "MpcLeadTrajectory")
 
     self._scroller.add_widgets([
       self._adb_toggle,
@@ -111,6 +112,7 @@ class DeveloperLayoutMici(NavScroller):
       self._lane_centering_pause_toggle,
       self._lane_center_offset_toggle,
       self._lane_centering_e2e_authority_toggle,
+      self._mpc_lead_trajectory_toggle,
     ])
 
     # Toggle lists
@@ -123,6 +125,7 @@ class DeveloperLayoutMici(NavScroller):
       ("AlphaLongitudinalEnabled", self._alpha_long_toggle),
       ("ShowDebugInfo", self._debug_mode_toggle),
       ("LaneCentering", self._lane_centering_toggle),
+      ("MpcLeadTrajectory", self._mpc_lead_trajectory_toggle),
     )
     onroad_blocked_toggles = (self._adb_toggle, self._joystick_toggle)
     release_blocked_toggles = (self._joystick_toggle, self._long_maneuver_toggle, self._lat_maneuver_toggle, self._alpha_long_toggle)
