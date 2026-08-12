@@ -5,59 +5,41 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  mirror:
+  rebase:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      issues: write
     env:
       GIT_LFS_SKIP_SMUDGE: "1"
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 1
+          ref: sp-honda-dev-202608-mpc-toggle
+          fetch-depth: 0
 
-      - name: Stash the toggle patch outside the repo (we're about to switch trees)
-        run: cp .github/patches/mpcleadtrajectorytoggle.patch /tmp/mpcleadtrajectorytoggle.patch
-
-      - name: Fetch mvl-boston's current branch and reset onto it
-        run: |
+      - run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add mvl https://github.com/mvl-boston/openpilot.git || true
-          git fetch mvl sp-honda-dev-202608 --no-tags
-          git checkout -B sp-honda-dev-202608-mpc-toggle mvl/sp-honda-dev-202608
-      - id: patch
-        name: Reapply the MpcLeadTrajectory toggle on top
+          git fetch mvl sp-honda-dev-202608
+      - id: rebase
         run: |
-          if git am /tmp/mpcleadtrajectorytoggle.patch; then
+          if git rebase mvl/sp-honda-dev-202608; then
             echo "success=true" >> "$GITHUB_OUTPUT"
           else
-            git am --abort || true
+            git rebase --abort
             echo "success=false" >> "$GITHUB_OUTPUT"
           fi
-      - if: steps.patch.outputs.success == 'true'
-        name: Push (skip LFS binary push, GitLab remote is unreachable from here)
+      - if: steps.rebase.outputs.success == 'true'
         env:
           GIT_LFS_SKIP_PUSH: "1"
-        run: |
-          git fetch origin sp-honda-dev-202608-mpc-toggle --no-tags || true
-          git push origin sp-honda-dev-202608-mpc-toggle --force-with-lease
+        run: git push origin sp-honda-dev-202608-mpc-toggle --force-with-lease
 
-      - if: steps.patch.outputs.success == 'false'
+      - if: steps.rebase.outputs.success == 'false'
         uses: actions/github-script@v7
         with:
           script: |
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: 'sp-honda-dev-202608-mpc-toggle: MpcLeadTrajectory patch no longer applies',
-              body: 'mvl-boston/openpilot sp-honda-dev-202608 changed in a way that conflicts with ' +
-                    '.github/patches/mpcleadtrajectorytoggle.patch (long_mpc.py / longitudinal_planner.py / ' +
-                    'both developer.py layouts / params_keys.h / log.capnp). Resolve manually: git fetch mvl ' +
-                    'sp-honda-dev-202608, git checkout -B sp-honda-dev-202608-mpc-toggle mvl/sp-honda-dev-202608, ' +
-                    'git am .github/patches/mpcleadtrajectorytoggle.patch, fix conflicts, git am --continue, ' +
-                    'then on the branch carrying the toggle source changes regenerate the patch with ' +
-                    '`git format-patch -1 HEAD --stdout > .github/patches/mpcleadtrajectorytoggle.patch`, ' +
-                    'and push --force-with-lease.'
+              title: 'sp-honda-dev-202608-mpc-toggle rebase conflict',
+              body: 'Auto-rebase onto mvl-boston/openpilot sp-honda-dev-202608 failed — the MpcLeadTrajectory toggle commit (long_mpc.py / longitudinal_planner.py / both developer.py layouts / params_keys.h / log.capnp) conflicts with an upstream change. Resolve manually: cd into the sp-honda-dev-202608-mpc-toggle worktree, git fetch mvl sp-honda-dev-202608, git rebase mvl/sp-honda-dev-202608, resolve, git push --force-with-lease.'
             })
