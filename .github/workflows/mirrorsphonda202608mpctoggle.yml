@@ -18,7 +18,7 @@ jobs:
           fetch-depth: 1
 
       - name: Stash the toggle patch outside the repo (we're about to switch trees)
-        run: cp .github/patches/mpcleadtrajectorytoggle.patch /tmp/mpc-lead-trajectory-toggle.patch
+        run: cp .github/patches/mpcleadtrajectorytoggle.patch /tmp/mpcleadtrajectorytoggle.patch
 
       - name: Fetch mvl-boston's current branch and reset onto it
         run: |
@@ -27,7 +27,6 @@ jobs:
           git remote add mvl https://github.com/mvl-boston/openpilot.git || true
           git fetch mvl sp-honda-dev-202608 --no-tags
           git checkout -B sp-honda-dev-202608-mpc-toggle mvl/sp-honda-dev-202608
-
       - id: patch
         name: Reapply the MpcLeadTrajectory toggle on top
         run: |
@@ -37,7 +36,6 @@ jobs:
             git am --abort || true
             echo "success=false" >> "$GITHUB_OUTPUT"
           fi
-
       - if: steps.patch.outputs.success == 'true'
         name: Push (skip LFS binary push, GitLab remote is unreachable from here)
         env:
