@@ -40,7 +40,9 @@ jobs:
         name: Push (skip LFS binary push, GitLab remote is unreachable from here)
         env:
           GIT_LFS_SKIP_PUSH: "1"
-        run: git push origin sp-honda-dev-202608-mpc-toggle --force-with-lease
+        run: |
+          git fetch origin sp-honda-dev-202608-mpc-toggle --no-tags || true
+          git push origin sp-honda-dev-202608-mpc-toggle --force-with-lease
 
       - if: steps.patch.outputs.success == 'false'
         uses: actions/github-script@v7
