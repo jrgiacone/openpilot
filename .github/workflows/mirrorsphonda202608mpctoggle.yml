@@ -16,7 +16,7 @@ jobs:
           fetch-depth: 1
 
       - name: Stash the toggle patch outside the repo (we're about to switch trees)
-        run: cp .github/patches/mpc-lead-trajectory-toggle.patch /tmp/mpc-lead-trajectory-toggle.patch
+        run: cp .github/patches/mpcleadtrajectorytoggle.patch /tmp/mpc-lead-trajectory-toggle.patch
 
       - name: Fetch mvl-boston's current branch and reset onto it
         run: |
@@ -29,7 +29,7 @@ jobs:
       - id: patch
         name: Reapply the MpcLeadTrajectory toggle on top
         run: |
-          if git am /tmp/mpc-lead-trajectory-toggle.patch; then
+          if git am /tmp/mpcleadtrajectorytoggle.patch; then
             echo "success=true" >> "$GITHUB_OUTPUT"
           else
             git am --abort || true
@@ -51,11 +51,11 @@ jobs:
               repo: context.repo.repo,
               title: 'sp-honda-dev-202608-mpc-toggle: MpcLeadTrajectory patch no longer applies',
               body: 'mvl-boston/openpilot sp-honda-dev-202608 changed in a way that conflicts with ' +
-                    '.github/patches/mpc-lead-trajectory-toggle.patch (long_mpc.py / longitudinal_planner.py / ' +
+                    '.github/patches/mpcleadtrajectorytoggle.patch (long_mpc.py / longitudinal_planner.py / ' +
                     'both developer.py layouts / params_keys.h / log.capnp). Resolve manually: git fetch mvl ' +
                     'sp-honda-dev-202608, git checkout -B sp-honda-dev-202608-mpc-toggle mvl/sp-honda-dev-202608, ' +
-                    'git am .github/patches/mpc-lead-trajectory-toggle.patch, fix conflicts, git am --continue, ' +
+                    'git am .github/patches/mpcleadtrajectorytoggle.patch, fix conflicts, git am --continue, ' +
                     'then on the branch carrying the toggle source changes regenerate the patch with ' +
-                    '`git format-patch -1 HEAD --stdout > .github/patches/mpc-lead-trajectory-toggle.patch`, ' +
+                    '`git format-patch -1 HEAD --stdout > .github/patches/mpcleadtrajectorytoggle.patch`, ' +
                     'and push --force-with-lease.'
             })
