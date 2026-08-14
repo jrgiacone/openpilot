@@ -1,0 +1,72 @@
+name: Mirror commaai master + opendbc patches
+on:
+  schedule:
+    - cron: '15 9 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    env:
+      GIT_LFS_SKIP_SMUDGE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: master-jg
+          fetch-depth: 0
+
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add comma https://github.com/commaai/openpilot.git || true
+          git fetch comma master
+
+      - id: rebase
+        run: |
+          if git rebase comma/master; then
+            echo "success=true" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "success=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The rebase only moves the patch-infra commit, which adds files and makes
+      # one small edit to system/manager/build.py. What actually breaks is the
+      # opendbc patches no longer applying to the newly pinned opendbc, so check
+      # that here rather than waiting to find out on the device at build time.
+      - id: patches
+        if: steps.rebase.outputs.success == 'true'
+        run: |
+          git submodule update --init --depth 1 opendbc_repo
+          if ./scripts/apply-opendbc-patches.sh; then
+            echo "success=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "success=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.rebase.outputs.success == 'true' && steps.patches.outputs.success == 'true'
+        env:
+          GIT_LFS_SKIP_PUSH: "1"
+        run: git push origin master-jg --force-with-lease
+
+      - if: steps.rebase.outputs.success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'master-jg rebase conflict',
+              body: 'Auto-rebase onto commaai/openpilot master failed. The patch-infra commit (.github/patches/opendbc/, scripts/apply-opendbc-patches.sh, system/manager/build.py) conflicts with an upstream change — most likely build.py moved or was restructured. Resolve manually: git fetch comma master, git rebase comma/master, resolve, git push --force-with-lease.'
+            })
+
+      - if: steps.patches.outputs.success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'master-jg opendbc patches no longer apply',
+              body: 'The rebase onto commaai/openpilot master succeeded, but an opendbc patch in .github/patches/opendbc/ no longer applies to the opendbc revision that master now pins. master-jg was NOT pushed, so the branch on origin is still the last good state. Refresh the patch: git submodule update --init opendbc_repo, cd opendbc_repo, git apply --3way ../.github/patches/opendbc/<name>.patch, resolve, then re-export the patch and commit. Until then this branch is stale, not broken.'
+            })

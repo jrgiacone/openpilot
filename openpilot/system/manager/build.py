@@ -8,9 +8,21 @@ from openpilot.common.spinner import Spinner
 from openpilot.common.text_window import TextWindow
 from openpilot.common.hardware import HARDWARE, AGNOS
 
+def apply_opendbc_patches() -> None:
+  # Local opendbc fixes carried on this branch, applied to the stock submodule.
+  # Hard failure is intentional: a silently skipped patch means driving stock
+  # behavior while believing the fix is in.
+  script = os.path.join(BASEDIR, "scripts", "apply-opendbc-patches.sh")
+  if not os.path.exists(script):
+    return
+  subprocess.run(["bash", script], cwd=BASEDIR, check=True)
+
+
 def build() -> None:
   spinner = Spinner()
   spinner.update_progress(0, 100)
+
+  apply_opendbc_patches()
 
   HARDWARE.set_power_save(False)
   if AGNOS:
