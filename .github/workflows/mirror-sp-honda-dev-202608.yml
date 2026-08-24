@@ -16,6 +16,12 @@ jobs:
         with:
           ref: sp-honda-dev-202608
           fetch-depth: 0
+          # The default GITHUB_TOKEN cannot push commits that touch files under
+          # .github/workflows/ -- upstream carries its own workflow files, so the
+          # push is rejected without a PAT that has the `workflow` scope.
+          # Add one as the MIRROR_PAT repo secret; falls back to GITHUB_TOKEN,
+          # which only works while upstream touches no workflow files.
+          token: ${{ secrets.MIRROR_PAT || secrets.GITHUB_TOKEN }}
 
       - run: |
           git config user.name "github-actions[bot]"
