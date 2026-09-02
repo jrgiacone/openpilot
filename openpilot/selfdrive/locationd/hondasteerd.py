@@ -12,7 +12,10 @@ in ``opendbc/car/honda`` before deciding whether an adaptive controller should e
 the wheel.
 
 The cache is keyed by fingerprint and model version: a different car, or a learner whose
-model has changed shape, starts over rather than inheriting someone else's numbers.
+model has changed shape, starts over rather than inheriting someone else's numbers. It
+carries the evidence behind the model as well as the model itself - bucket coverage and
+the covariance of each fit - so a car compounds what it has learned across drives rather
+than restarting every ignition.
 """
 
 import time
