@@ -2324,6 +2324,35 @@ struct LateralTorqueParameters @0xe61690eb0b091692 {
   calPerc @13 :Int8;
 }
 
+struct HondaSteeringParameters @0xb0fdb62307de867f {
+  # Identified Honda EPS model, from opendbc/car/honda/steering_learner.py.
+  # Observed only: nothing in the control path consumes this.
+  valid @0 :Bool;
+  carFingerprint @1 :Text;
+
+  # lateral acceleration (m/s^2) produced per unit of normalized steer command,
+  # as a function of speed (m/s)
+  latAccelFactorBP @2 :List(Float32);
+  latAccelFactorV @3 :List(Float32);
+  friction @4 :Float32;
+  offset @5 :Float32;
+  asymmetry @6 :Float32;
+
+  # dead time and first order response time constant. Their sum is far better
+  # determined than either alone; prefer it when you care how late the car is.
+  actuatorDelay @7 :Float32;
+  responseTau @8 :Float32;
+
+  maxUsefulTorque @9 :Float32;
+  steerRatio @10 :Float32;
+  understeerGradient @11 :Float32;
+  driverTorqueThreshold @12 :Float32;
+
+  points @13 :UInt32;
+  learnedBuckets @14 :UInt8;
+  modelVersion @15 :Int32;
+}
+
 struct LateralDelay @0x98dfdb22c44df8d4 {
   lateralDelay @0 :Float32;
   validBlocks @1 :Int32;
@@ -2558,6 +2587,7 @@ struct Event {
     vehicleParameters @61 :VehicleParameters;
     lateralTorqueParameters @94 :LateralTorqueParameters;
     lateralDelay @146 : LateralDelay;
+    hondaSteeringParameters @153 :HondaSteeringParameters;
     cameraOdometry @63 :CameraOdometry;
     thumbnail @66: Thumbnail;
     onroadEvents @134: List(OnroadEvent);
