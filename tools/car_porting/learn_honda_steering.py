@@ -103,7 +103,7 @@ def describe(model, prior) -> str:
           f"asym {model.asymmetry:+.3f}  lag {model.effective_lag:.3f}s "
           f"(delay {model.actuator_delay:.3f} + tau {model.response_tau:.3f}, "
           f"prior {prior.actuator_delay:.3f})  "
-          f"usable torque {model.deadzone:.2f}..{model.max_useful_torque:.2f}  "
+          f"usable torque {model.max_useful_torque:.2f}  "
           f"steer ratio {model.steer_ratio:.2f} (prior {prior.steer_ratio:.2f})  "
           f"override {model.driver_torque_threshold:.0f}  "
           f"[{model.points} pts, {'valid' if model.valid else 'NOT CONVERGED'}]")
