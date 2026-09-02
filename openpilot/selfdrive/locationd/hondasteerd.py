@@ -15,6 +15,8 @@ The cache is keyed by fingerprint and model version: a different car, or a learn
 model has changed shape, starts over rather than inheriting someone else's numbers.
 """
 
+import time
+
 import openpilot.cereal.messaging as messaging
 from opendbc.car.structs import car
 from opendbc.car.honda.steering_learner import (
@@ -44,9 +46,8 @@ def is_honda(CP) -> bool:
   return CP.brand == "honda"
 
 
-def load_cached(fingerprint: str) -> HondaSteeringModel | None:
-  """The model from a previous ignition, if it belongs to this car and this learner."""
-  raw = Params().get(PARAMS_KEY)
+def parse_cached(raw, fingerprint: str) -> HondaSteeringModel | None:
+  """A cached model, if it is readable and belongs to this car and this learner."""
   if raw is None:
     return None
   try:
@@ -62,6 +63,10 @@ def load_cached(fingerprint: str) -> HondaSteeringModel | None:
     return None
   cloudlog.info(f"hondasteerd: resuming {fingerprint} from cache, {model.points} points")
   return model
+
+
+def load_cached(fingerprint: str) -> HondaSteeringModel | None:
+  return parse_cached(Params().get(PARAMS_KEY), fingerprint)
 
 
 def fill_msg(model: HondaSteeringModel, valid: bool):
@@ -93,8 +98,11 @@ def main():
   params = Params()
   CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
   if not is_honda(CP):
-    cloudlog.info(f"hondasteerd: {CP.carFingerprint} is not a Honda, exiting")
-    return
+    # manager already gates this process on brand; this only catches a manual launch,
+    # and idles rather than exiting so a mistake cannot become a restart loop
+    cloudlog.info(f"hondasteerd: {CP.carFingerprint} is not a Honda, idling")
+    while True:
+      time.sleep(60)
 
   fingerprint = str(CP.carFingerprint)
   learner = HondaSteeringLearner(CP, dt=DT, learned=load_cached(fingerprint))
