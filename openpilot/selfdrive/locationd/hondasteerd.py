@@ -69,7 +69,14 @@ def parse_cached(raw, fingerprint: str) -> HondaSteeringModel | None:
 
 
 def load_cached(fingerprint: str) -> HondaSteeringModel | None:
-  return parse_cached(Params().get(PARAMS_KEY), fingerprint)
+  # Params.get raises on a key missing from params_keys.h, and this daemon exists to
+  # observe: losing the resume is a cost, taking the process down with it is not.
+  try:
+    raw = Params().get(PARAMS_KEY)
+  except Exception:  # noqa: BLE001
+    cloudlog.exception("hondasteerd: could not read the model cache")
+    return None
+  return parse_cached(raw, fingerprint)
 
 
 def fill_msg(model: HondaSteeringModel, valid: bool):
@@ -171,7 +178,10 @@ def main():
     if frame % CACHE_DECIMATION == 0:
       model = learner.model()
       if model.valid:
-        params.put(PARAMS_KEY, model.to_json())
+        try:
+          params.put(PARAMS_KEY, model.to_json())
+        except Exception:  # noqa: BLE001 - same reasoning as the read: never fatal
+          cloudlog.exception("hondasteerd: could not write the model cache")
 
 
 if __name__ == "__main__":
