@@ -17,6 +17,9 @@ K = 1000
 CHUNK_SIZE = 1000 * K
 CACHE_SIZE = 10 * 1024 * 1024 * 1024  # total cache size in GB
 
+# Standard browser User-Agent to avoid bot rejection
+BROWSER_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
@@ -89,6 +92,9 @@ class URLFile:
     pass
 
   def _request(self, method: str, url: str, headers: dict[str, str] | None = None) -> BaseHTTPResponse:
+    if headers is None:
+      headers = {}
+    headers.setdefault('User-Agent', BROWSER_USER_AGENT)
     try:
       return URLFile.pool_manager().request(method, url, timeout=self._timeout, headers=headers)
     except MaxRetryError as e:

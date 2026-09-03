@@ -5,10 +5,13 @@ API_HOST = os.getenv('API_HOST', 'https://api.commadotai.com')
 
 # TODO: this should be merged into common.api
 
+# Standard browser User-Agent to avoid bot rejection
+BROWSER_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+
 class CommaApi:
   def __init__(self, token=None):
     self.session = requests.Session()
-    self.session.headers['User-agent'] = 'OpenpilotTools'
+    self.session.headers['User-Agent'] = BROWSER_USER_AGENT
     if token:
       self.session.headers['Authorization'] = 'JWT ' + token
 
