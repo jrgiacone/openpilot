@@ -41,6 +41,9 @@ def model_from_msg(p) -> HondaSteeringModel:
     points=p.points,
     learned_buckets=p.learnedBuckets,
     valid=p.valid,
+    diverged=p.diverged,
+    resets=p.resets,
+    asymmetry_learned=p.asymmetryLearned,
   )
 
 
@@ -55,14 +58,16 @@ def report(model: HondaSteeringModel, prior: HondaSteeringModel | None) -> str:
   lines = [
     f"{model.fingerprint}   {model.points} points, "
     f"{model.learned_buckets} speed buckets learned, "
-    f"{'converged' if model.valid else 'NOT CONVERGED - keep driving'}",
+    f"{'converged' if model.valid else 'DIVERGED - fit reset' if model.diverged else 'NOT CONVERGED - keep driving'}"
+    + (f", {model.resets} reset(s)" if model.resets else ""),
     "",
     f"  EPS gain     {sched}",
     f"               m/s^2 of lateral acceleration per unit of steer command"
     + (f"; every Honda's prior is {prior.lat_accel_factor(20.0):.2f}" if prior else ""),
     f"  friction     {vs(model.friction, prior.friction if prior else None)}",
     f"  offset       {model.offset:+.3f}   road crown, alignment and EPS trim",
-    f"  asymmetry    {model.asymmetry:+.3f}   right gain minus left",
+    f"  asymmetry    {model.asymmetry:+.3f}   right gain minus left"
+    + ("" if model.asymmetry_learned else "   (not yet excited both ways)"),
     f"  lag          {vs(model.effective_lag, prior.effective_lag if prior else None)} s"
     f"   = dead time {model.actuator_delay:.3f} + rack tau {model.response_tau:.3f}",
     f"  steer ratio  {vs(model.steer_ratio, prior.steer_ratio if prior else None, '{:.2f}')}",

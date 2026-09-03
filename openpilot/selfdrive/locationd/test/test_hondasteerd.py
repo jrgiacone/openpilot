@@ -34,6 +34,23 @@ class TestHondaSteerdCache:
     m = a_model()
     assert parse_cached(m.to_json(), m.fingerprint) == m
 
+  def test_round_trips_through_params(self):
+    """The write path, which the earlier tests never touched.
+
+    Params.put casts by (python type, key type): a JSON-typed key takes a dict and
+    rejects a str, and Params.get on that key hands back a parsed dict rather than text.
+    Both halves have to agree, and only an end-to-end round trip catches it.
+    """
+    from openpilot.common.params import Params
+    m = a_model()
+    params = Params()
+    params.put(PARAMS_KEY, m.to_dict())
+    assert parse_cached(params.get(PARAMS_KEY), m.fingerprint) == m
+
+  def test_accepts_a_parsed_dict(self):
+    m = a_model()
+    assert parse_cached(m.to_dict(), m.fingerprint) == m
+
   def test_rejects_another_car(self):
     """A cache must never seed a car it was not measured on."""
     m = a_model(CAR.HONDA_CIVIC_2022)

@@ -41,6 +41,10 @@ PARAMS_KEY = "HondaSteeringParameters"
 DECIMATION = 2
 DT = 0.01 * DECIMATION
 
+# Two deviceMotion periods at its nominal 20 Hz. Older than this and the yaw rate no
+# longer describes the moment the command was acting on.
+MAX_YAW_AGE = 0.1
+
 PUBLISH_DECIMATION = 25    # ~4 Hz relative to the decimated rate
 CACHE_DECIMATION = 3000    # ~60 s
 
@@ -50,11 +54,16 @@ def is_honda(CP) -> bool:
 
 
 def parse_cached(raw, fingerprint: str) -> HondaSteeringModel | None:
-  """A cached model, if it is readable and belongs to this car and this learner."""
+  """A cached model, if it is readable and belongs to this car and this learner.
+
+  The key is JSON-typed, so Params.get hands back a parsed dict; str and bytes are
+  accepted too so a cache written by any route through this code still reads.
+  """
   if raw is None:
     return None
   try:
-    model = HondaSteeringModel.from_json(raw)
+    model = (HondaSteeringModel.from_dict(raw) if isinstance(raw, dict)
+             else HondaSteeringModel.from_json(raw))
   except (ValueError, TypeError) as e:
     cloudlog.warning(f"hondasteerd: discarding unreadable cache: {e}")
     return None
@@ -99,6 +108,9 @@ def fill_msg(model: HondaSteeringModel, valid: bool):
   p.points = int(model.points)
   p.learnedBuckets = int(model.learned_buckets)
   p.modelVersion = MODEL_VERSION
+  p.diverged = bool(model.diverged)
+  p.resets = int(model.resets)
+  p.asymmetryLearned = bool(model.asymmetry_learned)
   return msg
 
 
@@ -122,10 +134,13 @@ def main():
   sm = messaging.SubMaster(['carControl', 'carOutput', 'carState', 'deviceMotion',
                             'extrinsicsCalibration', 'vehicleParameters'], poll='carState')
 
-  # deviceMotion runs at 20 Hz against the learner's 50 Hz, so yaw rate is held between
-  # updates. The learner differentiates lateral acceleration over 0.1 s, which spans two
-  # updates, so the staircase is smoothed rather than differentiated.
+  # deviceMotion nominally runs at 20 Hz against the learner's 50 Hz, so yaw rate is held
+  # between updates and the learner's 0.1 s differentiation window smooths the staircase.
+  # At startup it can run far slower - 7 Hz was measured on the first segment of route
+  # 729a2e65b1f6201d - and a yaw rate that stale is simply a wrong lateral acceleration,
+  # so samples older than MAX_YAW_AGE are marked invalid rather than fitted.
   yaw_rate = None
+  yaw_rate_t = 0.0
   roll = 0.0
   t0 = None
   frame = 0
@@ -143,6 +158,7 @@ def main():
       dm = sm['deviceMotion']
       if dm.angularVelocityDevice.valid and dm.orientationNED.valid and dm.inputsOK and dm.sensorsOK:
         yaw_rate = calibrator.build_calibrated_pose(Pose.from_device_motion(dm)).angular_velocity.yaw
+        yaw_rate_t = sm.logMonoTime['deviceMotion'] * 1e-9
       else:
         yaw_rate = None
 
@@ -170,6 +186,7 @@ def main():
       saturated=abs(torque) > 0.99,
       yaw_rate=yaw_rate,
       roll=roll,
+      lat_accel_valid=yaw_rate is not None and (t - yaw_rate_t) <= MAX_YAW_AGE,
     ))
 
     if frame % PUBLISH_DECIMATION == 0:
@@ -179,7 +196,9 @@ def main():
       model = learner.model()
       if model.valid:
         try:
-          params.put(PARAMS_KEY, model.to_json())
+          # a JSON-typed key takes a dict and serialises it; handing it a str raises,
+          # since the cast table has no (str, JSON) entry
+          params.put(PARAMS_KEY, model.to_dict())
         except Exception:  # noqa: BLE001 - same reasoning as the read: never fatal
           cloudlog.exception("hondasteerd: could not write the model cache")
 

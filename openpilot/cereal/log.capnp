@@ -2353,6 +2353,12 @@ struct HondaSteeringParameters @0xb0fdb62307de867f {
   points @13 :UInt32;
   learnedBuckets @14 :UInt8;
   modelVersion @15 :Int32;
+
+  # a fit that left the physically possible range, and how often that has happened.
+  # Published so a diverged fit is visible rather than looking like an unfitted one.
+  diverged @16 :Bool;
+  resets @17 :UInt16;
+  asymmetryLearned @18 :Bool;
 }
 
 struct LateralDelay @0x98dfdb22c44df8d4 {
