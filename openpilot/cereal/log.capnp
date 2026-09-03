@@ -2359,6 +2359,17 @@ struct HondaSteeringParameters @0xb0fdb62307de867f {
   diverged @16 :Bool;
   resets @17 :UInt16;
   asymmetryLearned @18 :Bool;
+
+  # Evidence about the roll compensation rather than about the car. Road roll is removed
+  # from the fitted lateral acceleration as sin(roll)*9.81, and on gentle lane keeping
+  # that estimate is not small next to the signal: on route 729a2e65b1f6201d its standard
+  # deviation was 1.07x the lateral acceleration itself, and subtracting it cost 40% of
+  # the correlation between command and target. rollCompFraction is how often the
+  # estimate was trusted; the two correlations are the same samples scored with and
+  # without it, so the fleet can settle whether the compensation belongs in the fit.
+  rollCompFraction @19 :Float32;
+  latAccelTorqueCorr @20 :Float32;
+  latAccelTorqueCorrRaw @21 :Float32;
 }
 
 struct LateralDelay @0x98dfdb22c44df8d4 {

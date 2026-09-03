@@ -83,6 +83,7 @@ class TestHondaSteerdMsg:
     m = a_model()
     m.friction, m.offset, m.asymmetry = 0.041, -0.017, 0.008
     m.actuator_delay, m.response_tau = 0.183, 0.072
+    m.roll_comp_fraction, m.lat_accel_torque_corr, m.lat_accel_torque_corr_raw = 0.93, 0.21, 0.14
     p = fill_msg(m, valid=True).hondaSteeringParameters
 
     assert p.valid and p.carFingerprint == m.fingerprint
@@ -97,6 +98,11 @@ class TestHondaSteerdMsg:
     assert p.driverTorqueThreshold == pytest.approx(m.driver_torque_threshold)
     assert p.points == m.points
     assert p.modelVersion == MODEL_VERSION
+    # the roll compensation evidence: without it a log cannot say whether removing the
+    # roll estimate helped the fit or hurt it
+    assert p.rollCompFraction == pytest.approx(m.roll_comp_fraction)
+    assert p.latAccelTorqueCorr == pytest.approx(m.lat_accel_torque_corr)
+    assert p.latAccelTorqueCorrRaw == pytest.approx(m.lat_accel_torque_corr_raw)
 
 
 class TestYawSignConvention:

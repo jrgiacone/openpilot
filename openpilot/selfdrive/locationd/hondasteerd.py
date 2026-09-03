@@ -121,6 +121,9 @@ def fill_msg(model: HondaSteeringModel, valid: bool):
   p.diverged = bool(model.diverged)
   p.resets = int(model.resets)
   p.asymmetryLearned = bool(model.asymmetry_learned)
+  p.rollCompFraction = float(model.roll_comp_fraction)
+  p.latAccelTorqueCorr = float(model.lat_accel_torque_corr)
+  p.latAccelTorqueCorrRaw = float(model.lat_accel_torque_corr_raw)
   return msg
 
 
