@@ -84,6 +84,7 @@ class TestHondaSteerdMsg:
     m.friction, m.offset, m.asymmetry = 0.041, -0.017, 0.008
     m.actuator_delay, m.response_tau = 0.183, 0.072
     m.roll_comp_fraction, m.lat_accel_torque_corr, m.lat_accel_torque_corr_raw = 0.93, 0.21, 0.14
+    m.delay_learned, m.delay_railed = True, False
     p = fill_msg(m, valid=True).hondaSteeringParameters
 
     assert p.valid and p.carFingerprint == m.fingerprint
@@ -94,6 +95,11 @@ class TestHondaSteerdMsg:
     assert p.asymmetry == pytest.approx(m.asymmetry)
     assert p.actuatorDelay == pytest.approx(m.actuator_delay)
     assert p.responseTau == pytest.approx(m.response_tau)
+    # the only lag figure with evidence behind it, and whether the dead time beside it is
+    # a measurement or the prior it started from
+    assert p.effectiveLag == pytest.approx(m.actuator_delay + m.response_tau)
+    assert p.delayLearned == m.delay_learned
+    assert p.delayRailed == m.delay_railed
     assert p.steerRatio == pytest.approx(m.steer_ratio)
     assert p.driverTorqueThreshold == pytest.approx(m.driver_torque_threshold)
     assert p.points == m.points

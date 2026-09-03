@@ -2340,10 +2340,18 @@ struct HondaSteeringParameters @0xb0fdb62307de867f {
   offset @5 :Float32;
   asymmetry @6 :Float32;
 
-  # dead time and first order response time constant. Their sum is far better
-  # determined than either alone; prefer it when you care how late the car is.
+  # Dead time and first order response time constant. Only the sum is ever determined:
+  # fitting the two by output error over route 729a2e65b1f6201d leaves 0.2% residual
+  # leverage on responseTau across its whole range, against 224% on a synthetic rack of
+  # known truth at the same noise and excitation. effectiveLag is their sum and the lag
+  # figure to trust; delayLearned says whether actuatorDelay is a measurement or the
+  # platform prior it started from, and delayRailed whether the winning candidate sat on
+  # an end of the delay bank's grid.
   actuatorDelay @7 :Float32;
   responseTau @8 :Float32;
+  effectiveLag @22 :Float32;
+  delayLearned @23 :Bool;
+  delayRailed @24 :Bool;
 
   maxUsefulTorque @9 :Float32;
   steerRatio @10 :Float32;
