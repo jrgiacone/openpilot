@@ -1,12 +1,19 @@
 import json
+import math
 import pathlib
 
+import numpy as np
 import pytest
 
 from opendbc.car.honda.interface import CarInterface
-from opendbc.car.honda.steering_learner import MODEL_VERSION, prior_from_car_params
+from opendbc.car.honda.steering_learner import (
+  MODEL_VERSION,
+  HondaSteeringLearner,
+  HondaSteerSample,
+  prior_from_car_params,
+)
 from opendbc.car.honda.values import CAR
-from openpilot.selfdrive.locationd.hondasteerd import PARAMS_KEY, fill_msg, parse_cached
+from openpilot.selfdrive.locationd.hondasteerd import DT, PARAMS_KEY, YAW_SIGN, fill_msg, parse_cached
 
 
 def a_model(fingerprint=CAR.HONDA_CIVIC_2022, valid=True):
@@ -90,3 +97,83 @@ class TestHondaSteerdMsg:
     assert p.driverTorqueThreshold == pytest.approx(m.driver_torque_threshold)
     assert p.points == m.points
     assert p.modelVersion == MODEL_VERSION
+
+
+class TestYawSignConvention:
+  """The two lateral acceleration sources have to agree on which way is positive.
+
+  ``_lat_accel`` prefers the yaw rate and falls back to the steering angle, so a sign
+  disagreement between them is not a constant error the fit can absorb: the learner
+  silently changes convention whenever deviceMotion goes stale, and while the yaw path
+  is live it fits a gain of the wrong sign against a positive-left torque command.
+  """
+
+  @staticmethod
+  def _learner():
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    return HondaSteeringLearner(CP, dt=DT, learned=None)
+
+  def _lat_accel(self, learner, *, yaw_rate, steering_angle_deg):
+    return learner._lat_accel(HondaSteerSample(
+      t=0.0, v_ego=20.0, torque_cmd=0.0,
+      steering_angle_deg=steering_angle_deg, steering_rate_deg=0.0,
+      driver_torque=0.0, lat_active=True, steering_pressed=False, saturated=False,
+      yaw_rate=yaw_rate, roll=0.0, lat_accel_valid=True,
+    ))
+
+  def test_both_branches_agree_on_a_right_hand_turn(self):
+    """A steady right hand turn, fed through the yaw path and the kinematic fallback."""
+    learner = self._learner()
+    v_ego, angle = 20.0, -5.0                       # negative steering angle is a right turn
+    curvature = math.radians(angle) / (learner.steer_ratio * learner.wheelbase)
+    # the calibrated frame is z-down, so the turn shows up as a positive raw yaw rate;
+    # hondasteerd flips it before the learner ever sees it
+    yaw_rate = YAW_SIGN * -(curvature * v_ego)
+
+    from_yaw = self._lat_accel(learner, yaw_rate=yaw_rate, steering_angle_deg=angle)
+    from_angle = self._lat_accel(learner, yaw_rate=None, steering_angle_deg=angle)
+
+    assert from_yaw < 0.0, "a right hand turn must make negative lateral acceleration"
+    assert math.copysign(1.0, from_yaw) == math.copysign(1.0, from_angle)
+    assert from_yaw == pytest.approx(from_angle, rel=1e-6)
+
+  def test_both_branches_agree_on_a_left_hand_turn(self):
+    learner = self._learner()
+    v_ego, angle = 20.0, 5.0
+    curvature = math.radians(angle) / (learner.steer_ratio * learner.wheelbase)
+    yaw_rate = YAW_SIGN * -(curvature * v_ego)
+
+    from_yaw = self._lat_accel(learner, yaw_rate=yaw_rate, steering_angle_deg=angle)
+    from_angle = self._lat_accel(learner, yaw_rate=None, steering_angle_deg=angle)
+
+    assert from_yaw > 0.0, "a left hand turn must make positive lateral acceleration"
+    assert math.copysign(1.0, from_yaw) == math.copysign(1.0, from_angle)
+    assert from_yaw == pytest.approx(from_angle, rel=1e-6)
+
+  def test_the_identified_gain_matches_the_truth_it_was_driven_with(self):
+    """The end to end symptom, on a synthetic car whose gain we know.
+
+    A correctly signed fit recovers the gain it was driven with and never diverges. With
+    the flip removed the same drive fits the wrong number and trips ``_check_divergence``
+    repeatedly, which is what route 729a2e65b1f6201d did 224 times in 18 minutes.
+    """
+    learner = self._learner()
+    gain, v_ego = 2.0, 20.0
+    rng = np.random.default_rng(0)
+    cmd = 0.0
+    for i in range(20000):
+      # a slow random walk, so the command is excited in both directions
+      cmd = float(np.clip(cmd + (rng.normal(0.0, 0.25) - cmd) * 0.01, -0.6, 0.6))
+      lat_accel = gain * cmd
+      yaw_rate = YAW_SIGN * -(lat_accel / v_ego)
+      learner.update(HondaSteerSample(
+        t=i * DT, v_ego=v_ego, torque_cmd=cmd,
+        steering_angle_deg=math.degrees(lat_accel / v_ego ** 2 * learner.steer_ratio * learner.wheelbase),
+        steering_rate_deg=0.0, driver_torque=0.0, lat_active=True,
+        steering_pressed=False, saturated=False,
+        yaw_rate=yaw_rate, roll=0.0, lat_accel_valid=True,
+      ))
+
+    model = learner.model()
+    assert model.resets == 0, "a correctly signed fit must not diverge"
+    assert model.lat_accel_factor_v[0] == pytest.approx(gain, rel=0.05)

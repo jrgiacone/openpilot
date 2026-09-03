@@ -45,6 +45,16 @@ DT = 0.01 * DECIMATION
 # longer describes the moment the command was acting on.
 MAX_YAW_AGE = 0.1
 
+# The calibrated frame is z-down, so a positive yaw rate is a right hand turn. Steering
+# angle and the torque command are both positive-left, and the learner's own kinematic
+# fallback derives lateral acceleration from the steering angle, so the yaw path has to be
+# flipped to match or the two disagree by a sign. Measured on route 729a2e65b1f6201d:
+# corr(kinematic lat accel, yaw * v) = -0.98, which made the fitted gain negative, put it
+# permanently outside [K_MIN_VALID, K_MAX_VALID] and cost 224 divergence resets in 18
+# minutes. Replaying that route with the flip takes the resets to zero and the steer ratio
+# from the 8.0 clip rail to 15.2 against a CarParams value of 15.38.
+YAW_SIGN = -1.0
+
 PUBLISH_DECIMATION = 25    # ~4 Hz relative to the decimated rate
 CACHE_DECIMATION = 3000    # ~60 s
 
@@ -157,7 +167,7 @@ def main():
     if sm.updated['deviceMotion']:
       dm = sm['deviceMotion']
       if dm.angularVelocityDevice.valid and dm.orientationNED.valid and dm.inputsOK and dm.sensorsOK:
-        yaw_rate = calibrator.build_calibrated_pose(Pose.from_device_motion(dm)).angular_velocity.yaw
+        yaw_rate = YAW_SIGN * calibrator.build_calibrated_pose(Pose.from_device_motion(dm)).angular_velocity.yaw
         yaw_rate_t = sm.logMonoTime['deviceMotion'] * 1e-9
       else:
         yaw_rate = None
