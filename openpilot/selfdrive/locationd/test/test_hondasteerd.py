@@ -1,11 +1,12 @@
 import json
+import pathlib
 
 import pytest
 
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.steering_learner import MODEL_VERSION, prior_from_car_params
 from opendbc.car.honda.values import CAR
-from openpilot.selfdrive.locationd.hondasteerd import fill_msg, parse_cached
+from openpilot.selfdrive.locationd.hondasteerd import PARAMS_KEY, fill_msg, parse_cached
 
 
 def a_model(fingerprint=CAR.HONDA_CIVIC_2022, valid=True):
@@ -13,6 +14,19 @@ def a_model(fingerprint=CAR.HONDA_CIVIC_2022, valid=True):
   m.valid = valid
   m.points = 5000
   return m
+
+
+class TestHondaSteerdParamsKey:
+  def test_the_cache_key_is_registered(self):
+    """Params.get raises on any key missing from params_keys.h.
+
+    An unregistered key is not a silent no-op: it takes the daemon down on its first
+    read, before the learner is even constructed, and the only visible symptom is
+    process_not_running.
+    """
+    registry = pathlib.Path(__file__).parents[3] / "common" / "params_keys.h"
+    assert f'"{PARAMS_KEY}"' in registry.read_text(), \
+      f"{PARAMS_KEY} must be registered in {registry}"
 
 
 class TestHondaSteerdCache:
