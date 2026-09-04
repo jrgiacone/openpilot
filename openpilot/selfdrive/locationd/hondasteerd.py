@@ -127,6 +127,7 @@ def fill_msg(model: HondaSteeringModel, valid: bool):
   p.rollCompFraction = float(model.roll_comp_fraction)
   p.latAccelTorqueCorr = float(model.lat_accel_torque_corr)
   p.latAccelTorqueCorrRaw = float(model.lat_accel_torque_corr_raw)
+  p.saturatedFraction = float(model.saturated_fraction)
   return msg
 
 
