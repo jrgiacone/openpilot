@@ -44,6 +44,12 @@ def model_from_msg(p) -> HondaSteeringModel:
     diverged=p.diverged,
     resets=p.resets,
     asymmetry_learned=p.asymmetryLearned,
+    delay_learned=p.delayLearned,
+    delay_railed=p.delayRailed,
+    roll_comp_fraction=p.rollCompFraction,
+    lat_accel_torque_corr=p.latAccelTorqueCorr,
+    lat_accel_torque_corr_raw=p.latAccelTorqueCorrRaw,
+    saturated_fraction=p.saturatedFraction,
   )
 
 
@@ -68,12 +74,27 @@ def report(model: HondaSteeringModel, prior: HondaSteeringModel | None) -> str:
     f"  offset       {model.offset:+.3f}   road crown, alignment and EPS trim",
     f"  asymmetry    {model.asymmetry:+.3f}   right gain minus left"
     + ("" if model.asymmetry_learned else "   (not yet excited both ways)"),
+    # only the sum is ever identified - see the responseTau note in log.capnp - so the
+    # split is deliberately not shown as though it were two measurements
     f"  lag          {vs(model.effective_lag, prior.effective_lag if prior else None)} s"
-    f"   = dead time {model.actuator_delay:.3f} + rack tau {model.response_tau:.3f}",
-    f"  steer ratio  {vs(model.steer_ratio, prior.steer_ratio if prior else None, '{:.2f}')}",
+    + ("   MEASURED" if model.delay_learned else "   NOT MEASURED - this is the platform prior")
+    + ("   [RAILED on the end of the delay grid]" if model.delay_railed else ""),
+    (f"  steer ratio  {vs(model.steer_ratio, prior.steer_ratio if prior else None, '{:.2f}')}"
+     "   cross-check against vehicleParameters.steerRatio"),
     f"  understeer   {model.understeer_gradient:+.4f} rad per m/s^2",
     f"  override     {model.driver_torque_threshold:.0f}"
     + (f"  (values.py STEER_THRESHOLD {prior.driver_torque_threshold:.0f})" if prior else ""),
+    "",
+    "  evidence (about the fit, not about the car)",
+    (f"    saturated      {model.saturated_fraction * 100:.1f}% of active samples hit the "
+     f"command ceiling ({model.max_useful_torque:.2f})"),
+    f"    roll estimate  gate accepted {model.roll_comp_fraction * 100:.1f}% of samples",
+    (f"    corr(cmd, lat accel)  {model.lat_accel_torque_corr_raw:+.3f} uncompensated   "
+     f"{model.lat_accel_torque_corr:+.3f} roll compensated"),
+    "                   "
+    + ("uncompensated tracks better, which is the target being fitted"
+       if model.lat_accel_torque_corr_raw >= model.lat_accel_torque_corr
+       else "ROLL COMPENSATION WOULD HELP HERE - it is off; worth revisiting"),
   ]
   return "\n".join(lines)
 
