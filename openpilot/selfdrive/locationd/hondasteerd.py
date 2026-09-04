@@ -92,7 +92,7 @@ def load_cached(fingerprint: str) -> HondaSteeringModel | None:
   # observe: losing the resume is a cost, taking the process down with it is not.
   try:
     raw = Params().get(PARAMS_KEY)
-  except Exception:  # noqa: BLE001
+  except Exception:
     cloudlog.exception("hondasteerd: could not read the model cache")
     return None
   return parse_cached(raw, fingerprint)
@@ -212,10 +212,11 @@ def main():
       model = learner.model()
       if model.valid:
         try:
-          # a JSON-typed key takes a dict and serialises it; handing it a str raises,
+          # a JSON-typed key takes a dict and serializes it; handing it a str raises,
           # since the cast table has no (str, JSON) entry
           params.put(PARAMS_KEY, model.to_dict())
-        except Exception:  # noqa: BLE001 - same reasoning as the read: never fatal
+        except Exception:
+          # same reasoning as the read above: never fatal
           cloudlog.exception("hondasteerd: could not write the model cache")
 
 
