@@ -28,7 +28,17 @@ from opendbc.car.honda.values import CAR as HONDA
 from opendbc.car.tests.routes import routes as CAR_TEST_ROUTES
 from openpilot.tools.lib.logreader import LogReader
 
-DT = 0.01
+# hondasteerd feeds the learner every other carState, so the rate the model is actually
+# fit at on the car is 50 Hz, not the 100 Hz carState is logged at. Replaying every
+# message instead would hand the learner twice the samples per second of driving at half
+# the timestep, which is not the estimator that runs on the car: point counts come out
+# ~2x and the per-sample RLS forgetting runs twice as fast per second.
+DECIMATION = 2
+DT = 0.01 * DECIMATION
+# The calibrated frame is z-down, so a positive yaw rate is a right hand turn, while
+# steering angle and the torque command are both positive-left - see hondasteerd.py.
+YAW_SIGN = -1.0
+MAX_YAW_AGE = 0.1
 
 
 def honda_routes() -> dict[str, list[str]]:
@@ -43,14 +53,19 @@ def honda_routes() -> dict[str, list[str]]:
 
 def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose: bool = False):
   """Feed one route to a learner, creating one from the route's own carParams if needed."""
+  from openpilot.selfdrive.locationd.helpers import Pose, PoseCalibrator
+
   lr = LogReader(route, sort_by_time=True)
 
   CS = CC = None
   torque = 0.0
+  calibrator = PoseCalibrator()
   yaw_rate = None
+  yaw_rate_t = 0.0
   roll = 0.0
   t0 = None
   n = 0
+  frame = 0
 
   for msg in lr:
     which = msg.which()
@@ -59,8 +74,18 @@ def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose
       if not str(CP.carFingerprint).startswith(("HONDA", "ACURA")):
         raise ValueError(f"{route}: not a Honda ({CP.carFingerprint})")
       learner = HondaSteeringLearner(CP, dt=DT)
+    elif which == "extrinsicsCalibration":
+      calibrator.feed_extrinsics_calibration(msg.extrinsicsCalibration)
     elif which == "deviceMotion":
-      yaw_rate = msg.deviceMotion.angularVelocityDevice.z
+      # the learner needs a calibrated, correctly signed yaw rate, exactly as hondasteerd
+      # and honda_shadow_compare.py build it; the raw device-frame z is neither, and
+      # feeding it in fits the gain against a signal correlated -0.98 with the truth
+      dm = msg.deviceMotion
+      if dm.angularVelocityDevice.valid and dm.orientationNED.valid and dm.inputsOK and dm.sensorsOK:
+        yaw_rate = YAW_SIGN * calibrator.build_calibrated_pose(Pose.from_device_motion(dm)).angular_velocity.yaw
+        yaw_rate_t = msg.logMonoTime * 1e-9
+      else:
+        yaw_rate = None
     elif which == "vehicleParameters":
       roll = msg.vehicleParameters.roll
     elif which == "carOutput":
@@ -68,6 +93,9 @@ def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose
     elif which == "carControl":
       CC = msg.carControl
     elif which == "carState" and learner is not None and CC is not None:
+      frame += 1
+      if frame % DECIMATION:
+        continue
       CS = msg.carState
       t = msg.logMonoTime * 1e-9
       t0 = t if t0 is None else t0
@@ -85,6 +113,7 @@ def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose
         saturated=abs(torque) > 0.99,
         yaw_rate=yaw_rate,
         roll=roll,
+        lat_accel_valid=yaw_rate is not None and (t - yaw_rate_t) <= MAX_YAW_AGE,
       ))
       n += 1
 

@@ -64,7 +64,10 @@ from opendbc.car.tests.routes import routes as CAR_TEST_ROUTES
 # Importing them lazily, only where a route is actually read, keeps the scoring logic in this
 # file - _predict/_Scorer/_ground_truth_lat_accel - importable and unit-testable without it.
 
-DT = 0.01
+# hondasteerd decimates carState by 2 before feeding the learner, so the fit and the
+# scoring both have to run at 50 Hz to be the estimator that actually runs on the car.
+DECIMATION = 2
+DT = 0.01 * DECIMATION
 # The calibrated frame is z-down, so a positive yaw rate is a right hand turn, while
 # steering angle and the torque command are both positive-left - see hondasteerd.py.
 YAW_SIGN = -1.0
@@ -190,6 +193,7 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
   roll = 0.0
   frozen: HondaSteeringModel | None = None
   n_scored_before = scorer.n
+  frame = 0
 
   for msg in msgs:
     which = msg.which()
@@ -214,6 +218,9 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
     elif which == "carControl":
       CC = msg.carControl
     elif which == "carState" and learner is not None and CC is not None:
+      frame += 1
+      if frame % DECIMATION:
+        continue
       CS = msg.carState
       t = msg.logMonoTime * 1e-9
 
