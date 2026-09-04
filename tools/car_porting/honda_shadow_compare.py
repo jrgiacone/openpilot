@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Shadow-mode comparison: does the learned Honda steering model predict the car's actual
-behaviour better than the hand-tuned prior it started from?
+behavior better than the hand-tuned prior it started from?
 
 This is the gate before anything in ``steering_learner.py`` is worth wiring into control.
 Nothing here touches the control path - it is a pure open-loop, out-of-sample comparison:
@@ -257,11 +257,11 @@ def describe(scorer: _Scorer, frozen: HondaSteeringModel) -> str:
   lines = [f"held-out RMS lat accel error: learned {learned_rms:.3f} m/s^2  "
            f"prior {prior_rms:.3f} m/s^2  n={scorer.n}  [{verdict}]  "
            f"(froze {'valid' if frozen.valid else 'NOT CONVERGED'} @ {frozen.points} pts)"]
-  for i, centre in enumerate(speed_bucket_centres()):
+  for i, center in enumerate(speed_bucket_centres()):
     lr, n = scorer.bucket_rms(i, "learned")
     pr, _ = scorer.bucket_rms(i, "prior")
     if n:
-      lines.append(f"    ~{centre:>4.0f} m/s: learned {lr:.3f}  prior {pr:.3f}  n={n}")
+      lines.append(f"    ~{center:>4.0f} m/s: learned {lr:.3f}  prior {pr:.3f}  n={n}")
   return "\n".join(lines)
 
 
@@ -300,7 +300,7 @@ def main() -> int:
         # routes for one platform share a learner and a scorer: the split applies across
         # the platform's whole route set, not each route individually
         learner, frozen = compare_route(route, args.split, learner, scorer, args.verbose)
-      except Exception as e:  # noqa: BLE001 - one bad route must not sink the sweep
+      except Exception as e:  # one bad route must not sink the sweep
         print(f"{car}: {route}: {e}", file=sys.stderr)
     if learner is None or frozen is None:
       continue
