@@ -85,6 +85,7 @@ class TestHondaSteerdMsg:
     m.actuator_delay, m.response_tau = 0.183, 0.072
     m.roll_comp_fraction, m.lat_accel_torque_corr, m.lat_accel_torque_corr_raw = 0.93, 0.21, 0.14
     m.delay_learned, m.delay_railed = True, False
+    m.saturated_fraction = 0.06
     p = fill_msg(m, valid=True).hondaSteeringParameters
 
     assert p.valid and p.carFingerprint == m.fingerprint
@@ -109,6 +110,9 @@ class TestHondaSteerdMsg:
     assert p.rollCompFraction == pytest.approx(m.roll_comp_fraction)
     assert p.latAccelTorqueCorr == pytest.approx(m.lat_accel_torque_corr)
     assert p.latAccelTorqueCorrRaw == pytest.approx(m.lat_accel_torque_corr_raw)
+    # maxUsefulTorque is carried from the prior, not learned; this is the evidence for
+    # whether that ceiling is actually limiting real driving on this car
+    assert p.saturatedFraction == pytest.approx(m.saturated_fraction)
 
 
 class TestYawSignConvention:

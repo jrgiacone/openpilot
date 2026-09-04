@@ -2378,6 +2378,13 @@ struct HondaSteeringParameters @0xb0fdb62307de867f {
   rollCompFraction @19 :Float32;
   latAccelTorqueCorr @20 :Float32;
   latAccelTorqueCorrRaw @21 :Float32;
+
+  # maxUsefulTorque is carried from the prior rather than learned - a controller that
+  # never overdrives the rack produces no evidence of where it gives up. saturatedFraction
+  # is the evidence for whether that ceiling is actually limiting real driving on this car,
+  # without ever needing to raise it to find out: the fraction of active, hands-off samples
+  # where the command sent was saturated.
+  saturatedFraction @25 :Float32;
 }
 
 struct LateralDelay @0x98dfdb22c44df8d4 {
