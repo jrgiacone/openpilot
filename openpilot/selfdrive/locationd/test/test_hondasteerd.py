@@ -71,7 +71,9 @@ class TestHondaSteerdCache(OpenpilotTestCase):
     from openpilot.common.params import Params
     m = a_model()
     params = Params()
-    params.put(PARAMS_KEY, m.to_dict())
+    # block=True, as every other params test here does: put is asynchronous by default, so
+    # reading straight back races the write and gets None
+    params.put(PARAMS_KEY, m.to_dict(), block=True)
     assert parse_cached(params.get(PARAMS_KEY), m.fingerprint) == m
 
   def test_accepts_a_parsed_dict(self):
