@@ -1,9 +1,9 @@
 import json
 import math
 import pathlib
+import unittest
 
 import numpy as np
-import pytest
 
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.steering_learner import (
@@ -13,6 +13,7 @@ from opendbc.car.honda.steering_learner import (
   prior_from_car_params,
 )
 from opendbc.car.honda.values import CAR
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.locationd.hondasteerd import DT, PARAMS_KEY, YAW_SIGN, fill_msg, parse_cached
 
 
@@ -23,7 +24,24 @@ def a_model(fingerprint=CAR.HONDA_CIVIC_2022, valid=True):
   return m
 
 
-class TestHondaSteerdParamsKey:
+class ApproxMixin:
+  """``pytest.approx``'s default tolerance (rel=1e-6, abs=1e-12), for a unittest TestCase.
+
+  These assertions mostly compare a Float32 read back out of capnp against the Python
+  float that went in, so they need a relative tolerance rather than a fixed number of
+  decimal places: ``driverTorqueThreshold`` is O(1e3) and ``friction`` is O(1e-2).
+  """
+
+  def assertClose(self, actual, expected, rel=1e-6, msg=None):
+    if isinstance(expected, list | tuple):
+      self.assertEqual(len(actual), len(expected), msg)
+      for a, e in zip(actual, expected, strict=True):
+        self.assertClose(a, e, rel=rel, msg=msg)
+      return
+    self.assertAlmostEqual(actual, expected, delta=abs(expected) * rel + 1e-12, msg=msg)
+
+
+class TestHondaSteerdParamsKey(unittest.TestCase):
   def test_the_cache_key_is_registered(self):
     """Params.get raises on any key missing from params_keys.h.
 
@@ -36,7 +54,9 @@ class TestHondaSteerdParamsKey:
       f"{PARAMS_KEY} must be registered in {registry}"
 
 
-class TestHondaSteerdCache:
+class TestHondaSteerdCache(OpenpilotTestCase):
+  # test_round_trips_through_params writes to Params, so this class takes the per-test
+  # OpenpilotPrefix isolation the sibling locationd tests use
   def test_round_trips(self):
     m = a_model()
     assert parse_cached(m.to_json(), m.fingerprint) == m
@@ -51,7 +71,9 @@ class TestHondaSteerdCache:
     from openpilot.common.params import Params
     m = a_model()
     params = Params()
-    params.put(PARAMS_KEY, m.to_dict())
+    # block=True, as every other params test here does: put is asynchronous by default, so
+    # reading straight back races the write and gets None
+    params.put(PARAMS_KEY, m.to_dict(), block=True)
     assert parse_cached(params.get(PARAMS_KEY), m.fingerprint) == m
 
   def test_accepts_a_parsed_dict(self):
@@ -69,16 +91,17 @@ class TestHondaSteerdCache:
     d["version"] = MODEL_VERSION + 1
     assert parse_cached(json.dumps(d), d["fingerprint"]) is None
 
-  @pytest.mark.parametrize("raw", [None, "", "{", b"not json", json.dumps({"version": MODEL_VERSION})])
-  def test_survives_a_damaged_cache(self, raw):
+  def test_survives_a_damaged_cache(self):
     """Whatever is in the key, the daemon must start; the worst case is starting fresh."""
-    assert parse_cached(raw, str(CAR.HONDA_CIVIC_2022)) is None
+    for raw in (None, "", "{", b"not json", json.dumps({"version": MODEL_VERSION})):
+      with self.subTest(raw=raw):
+        assert parse_cached(raw, str(CAR.HONDA_CIVIC_2022)) is None
 
   def test_ignores_an_unconverged_cache(self):
     assert parse_cached(a_model(valid=False).to_json(), str(CAR.HONDA_CIVIC_2022)) is None
 
 
-class TestHondaSteerdMsg:
+class TestHondaSteerdMsg(ApproxMixin, unittest.TestCase):
   def test_carries_every_learned_field(self):
     m = a_model()
     m.friction, m.offset, m.asymmetry = 0.041, -0.017, 0.008
@@ -89,33 +112,33 @@ class TestHondaSteerdMsg:
     p = fill_msg(m, valid=True).hondaSteeringParameters
 
     assert p.valid and p.carFingerprint == m.fingerprint
-    assert list(p.latAccelFactorBP) == pytest.approx(m.lat_accel_factor_bp)
-    assert list(p.latAccelFactorV) == pytest.approx(m.lat_accel_factor_v)
-    assert p.friction == pytest.approx(m.friction)
-    assert p.offset == pytest.approx(m.offset)
-    assert p.asymmetry == pytest.approx(m.asymmetry)
-    assert p.actuatorDelay == pytest.approx(m.actuator_delay)
-    assert p.responseTau == pytest.approx(m.response_tau)
+    self.assertClose(list(p.latAccelFactorBP), m.lat_accel_factor_bp)
+    self.assertClose(list(p.latAccelFactorV), m.lat_accel_factor_v)
+    self.assertClose(p.friction, m.friction)
+    self.assertClose(p.offset, m.offset)
+    self.assertClose(p.asymmetry, m.asymmetry)
+    self.assertClose(p.actuatorDelay, m.actuator_delay)
+    self.assertClose(p.responseTau, m.response_tau)
     # the only lag figure with evidence behind it, and whether the dead time beside it is
     # a measurement or the prior it started from
-    assert p.effectiveLag == pytest.approx(m.actuator_delay + m.response_tau)
+    self.assertClose(p.effectiveLag, m.actuator_delay + m.response_tau)
     assert p.delayLearned == m.delay_learned
     assert p.delayRailed == m.delay_railed
-    assert p.steerRatio == pytest.approx(m.steer_ratio)
-    assert p.driverTorqueThreshold == pytest.approx(m.driver_torque_threshold)
+    self.assertClose(p.steerRatio, m.steer_ratio)
+    self.assertClose(p.driverTorqueThreshold, m.driver_torque_threshold)
     assert p.points == m.points
     assert p.modelVersion == MODEL_VERSION
     # the roll compensation evidence: without it a log cannot say whether removing the
     # roll estimate helped the fit or hurt it
-    assert p.rollCompFraction == pytest.approx(m.roll_comp_fraction)
-    assert p.latAccelTorqueCorr == pytest.approx(m.lat_accel_torque_corr)
-    assert p.latAccelTorqueCorrRaw == pytest.approx(m.lat_accel_torque_corr_raw)
+    self.assertClose(p.rollCompFraction, m.roll_comp_fraction)
+    self.assertClose(p.latAccelTorqueCorr, m.lat_accel_torque_corr)
+    self.assertClose(p.latAccelTorqueCorrRaw, m.lat_accel_torque_corr_raw)
     # maxUsefulTorque is carried from the prior, not learned; this is the evidence for
     # whether that ceiling is actually limiting real driving on this car
-    assert p.saturatedFraction == pytest.approx(m.saturated_fraction)
+    self.assertClose(p.saturatedFraction, m.saturated_fraction)
 
 
-class TestYawSignConvention:
+class TestYawSignConvention(ApproxMixin, unittest.TestCase):
   """The two lateral acceleration sources have to agree on which way is positive.
 
   ``_lat_accel`` prefers the yaw rate and falls back to the steering angle, so a sign
@@ -151,7 +174,7 @@ class TestYawSignConvention:
 
     assert from_yaw < 0.0, "a right hand turn must make negative lateral acceleration"
     assert math.copysign(1.0, from_yaw) == math.copysign(1.0, from_angle)
-    assert from_yaw == pytest.approx(from_angle, rel=1e-6)
+    self.assertClose(from_yaw, from_angle)
 
   def test_both_branches_agree_on_a_left_hand_turn(self):
     learner = self._learner()
@@ -164,7 +187,7 @@ class TestYawSignConvention:
 
     assert from_yaw > 0.0, "a left hand turn must make positive lateral acceleration"
     assert math.copysign(1.0, from_yaw) == math.copysign(1.0, from_angle)
-    assert from_yaw == pytest.approx(from_angle, rel=1e-6)
+    self.assertClose(from_yaw, from_angle)
 
   def test_the_identified_gain_matches_the_truth_it_was_driven_with(self):
     """The end to end symptom, on a synthetic car whose gain we know.
@@ -192,4 +215,4 @@ class TestYawSignConvention:
 
     model = learner.model()
     assert model.resets == 0, "a correctly signed fit must not diverge"
-    assert model.lat_accel_factor_v[0] == pytest.approx(gain, rel=0.05)
+    self.assertClose(model.lat_accel_factor_v[0], gain, rel=0.05)
