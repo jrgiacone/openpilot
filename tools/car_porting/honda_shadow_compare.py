@@ -18,9 +18,10 @@ Nothing here touches the control path - it is a pure open-loop, out-of-sample co
 
        a_pred = K(v)*(u - offset - friction*sign(rate) - asymmetry*max(u, 0))
 
-  4. Whichever model's prediction is closer to the real, roll-compensated, yaw-derived
-     lateral acceleration - RMS over the held-out portion - is the one that actually
-     explains this car, not just the one with more confident-looking numbers.
+  4. Whichever model's prediction is closer to the real, yaw-derived lateral acceleration -
+     RMS over the held-out portion - is the one that actually explains this car, not just
+     the one with more confident-looking numbers. The target follows
+     ``APPLY_ROLL_COMPENSATION``, so what is scored is what is fitted.
 
 A model that does not beat its own prior here has no business informing a tune change,
 whatever ``model().valid`` says: ``valid`` only means enough was measured to have an
@@ -44,6 +45,7 @@ import sys
 from collections import defaultdict, deque
 
 from opendbc.car.honda.steering_learner import (
+  APPLY_ROLL_COMPENSATION,
   MAX_LAT_ACCEL,
   MIN_LEARN_SPEED,
   RACK_MOTION_DEADBAND,
@@ -162,10 +164,21 @@ def _ground_truth_lat_accel(v_ego: float, yaw_rate: float | None, roll: float,
   Yaw rate when available, the same kinematic fallback ``steering_learner.py`` uses
   otherwise - fixed against the platform's own ``CarParams.steerRatio``, not either model's
   fitted one, so the ground truth does not itself depend on which model is being scored.
+
+  The roll term follows ``APPLY_ROLL_COMPENSATION``, because the target scored against has
+  to be the target fitted. This subtracted roll unconditionally until the compensation was
+  turned off in the learner and this tool was not moved with it, which scored both models
+  against a target neither was fitted on. That is not a penalty applied evenly to both: road
+  roll enters as sin(roll)*9.81, and on the gentle lane keeping this scores, that estimate
+  had a standard deviation 1.07x the lateral acceleration signal itself - enough noise in
+  the target to hide a real difference between the two models being compared. Fixing it took
+  route 729a2e65b1f6201d/0000001e from "learned beats prior by 23%" to 60%, and a candidate
+  extra model term from looking like a wash to visibly making held-out prediction worse -
+  which is the whole job of this tool, and it could not do it while scoring the wrong target.
   """
   a = yaw_rate * v_ego if yaw_rate is not None else (
     math.radians(steering_angle_deg) / (steer_ratio * wheelbase) * v_ego ** 2)
-  return a - math.sin(roll) * 9.81
+  return a - math.sin(roll) * 9.81 if APPLY_ROLL_COMPENSATION else a
 
 
 def compare_route(route: str, split: float, learner: HondaSteeringLearner | None,
