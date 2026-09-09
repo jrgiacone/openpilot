@@ -2385,6 +2385,16 @@ struct HondaSteeringParameters @0xb0fdb62307de867f {
   # without ever needing to raise it to find out: the fraction of active, hands-off samples
   # where the command sent was saturated.
   saturatedFraction @25 :Float32;
+
+  # What lagd makes of the same car, published beside the bank's own answer rather than
+  # replacing it. The delay bank races static models over all samples, so its winner
+  # absorbs dead time and response tau together - which is why responseTau reads 0 - and
+  # lagd already estimates lateral delay on every car. Whether the bank can be retired in
+  # favour of it is a fleet question: on the routes checked so far lagd never reached
+  # validBlocks >= 10, so it could not be compared. lagdValidBlocks is published so a
+  # value that has not converged is not mistaken for one that has.
+  lagdDelay @26 :Float32;
+  lagdValidBlocks @27 :Int32;
 }
 
 struct LateralDelay @0x98dfdb22c44df8d4 {

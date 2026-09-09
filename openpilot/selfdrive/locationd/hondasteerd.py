@@ -27,6 +27,7 @@ from opendbc.car.honda.steering_learner import (
   HondaSteeringLearner,
   HondaSteeringModel,
   HondaSteerSample,
+  normalized_command,
 )
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process
@@ -36,8 +37,10 @@ from openpilot.selfdrive.locationd.helpers import Pose, PoseCalibrator
 PARAMS_KEY = "HondaSteeringParameters"
 
 # carState arrives at 100 Hz. The learner is rate independent and costs about 76 us per
-# update, so running it at every other message keeps it under half a percent of a core
-# while staying fine enough for the delay bank, whose candidates are 30 ms apart.
+# update, so running it at every other message keeps it under half a percent of a core.
+# The delay bank builds its grid from this step time rather than from a fixed 30 ms - only
+# whole multiples of dt are resolvable, so at 50 Hz its candidates are 40 ms apart. See
+# steering_learner.py::delay_candidates.
 DECIMATION = 2
 DT = 0.01 * DECIMATION
 
@@ -98,7 +101,8 @@ def load_cached(fingerprint: str) -> HondaSteeringModel | None:
   return parse_cached(raw, fingerprint)
 
 
-def fill_msg(model: HondaSteeringModel, valid: bool):
+def fill_msg(model: HondaSteeringModel, valid: bool, lagd_delay: float = 0.0,
+             lagd_valid_blocks: int = 0):
   msg = messaging.new_message('hondaSteeringParameters')
   msg.valid = valid
   p = msg.hondaSteeringParameters
@@ -128,6 +132,9 @@ def fill_msg(model: HondaSteeringModel, valid: bool):
   p.latAccelTorqueCorr = float(model.lat_accel_torque_corr)
   p.latAccelTorqueCorrRaw = float(model.lat_accel_torque_corr_raw)
   p.saturatedFraction = float(model.saturated_fraction)
+  # lagd's own answer, published beside the bank's rather than replacing it - see log.capnp
+  p.lagdDelay = float(lagd_delay)
+  p.lagdValidBlocks = int(lagd_valid_blocks)
   return msg
 
 
@@ -148,8 +155,15 @@ def main():
   calibrator = PoseCalibrator()
 
   pm = messaging.PubMaster(['hondaSteeringParameters'])
+  # lateralDelay is subscribed for evidence only - it is published beside the delay bank's
+  # answer, never fitted on - so it is excluded from every liveness check. all_checks()
+  # gates lat_active below, and letting a 4 Hz service that may not be running at all, or
+  # that has not converged yet, decide whether this learner learns would be a real
+  # regression in exchange for a field nothing depends on.
   sm = messaging.SubMaster(['carControl', 'carOutput', 'carState', 'deviceMotion',
-                            'extrinsicsCalibration', 'vehicleParameters'], poll='carState')
+                            'extrinsicsCalibration', 'lateralDelay', 'vehicleParameters'],
+                           poll='carState', ignore_alive=['lateralDelay'],
+                           ignore_avg_freq=['lateralDelay'], ignore_valid=['lateralDelay'])
 
   # deviceMotion nominally runs at 20 Hz against the learner's 50 Hz, so yaw rate is held
   # between updates and the learner's 0.1 s differentiation window smooths the staircase.
@@ -184,7 +198,8 @@ def main():
     frame += 1
 
     CS, CC = sm['carState'], sm['carControl']
-    torque = sm['carOutput'].actuatorsOutput.torque
+    actuators = sm['carOutput'].actuatorsOutput
+    torque = normalized_command(actuators.torque, actuators.torqueOutputCan, CP)
     t = sm.logMonoTime['carState'] * 1e-9
     t0 = t if t0 is None else t0
 
@@ -207,7 +222,9 @@ def main():
     ))
 
     if frame % PUBLISH_DECIMATION == 0:
-      pm.send('hondaSteeringParameters', fill_msg(learner.model(), sm.all_checks()))
+      lagd = sm['lateralDelay']
+      pm.send('hondaSteeringParameters',
+              fill_msg(learner.model(), sm.all_checks(), lagd.lateralDelay, lagd.validBlocks))
 
     if frame % CACHE_DECIMATION == 0:
       model = learner.model()

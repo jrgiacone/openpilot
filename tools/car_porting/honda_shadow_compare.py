@@ -45,18 +45,20 @@ import sys
 from collections import defaultdict, deque
 
 from opendbc.car.honda.steering_learner import (
-  APPLY_ROLL_COMPENSATION,
+  DEFAULT_TARGET,
   MAX_LAT_ACCEL,
   MIN_LEARN_SPEED,
   RACK_MOTION_DEADBAND,
   RACK_RATE_TAU,
   SPEED_BUCKET_EDGES,
   STEADY_JERK,
+  TARGETS,
   HondaSteeringLearner,
   HondaSteeringModel,
   HondaSteerSample,
   _bucket_index,
   _smooth_sign,
+  normalized_command,
   speed_bucket_centres,
 )
 from opendbc.car.honda.values import CAR as HONDA
@@ -113,6 +115,11 @@ class _Scorer:
     self.n = 0
     self._sq_learned = 0.0
     self._sq_prior = 0.0
+    # the target's own spread, so RMS can be read on a scale free basis. Absolute RMS is
+    # not comparable between targets: each candidate target has a different variance, so a
+    # noisier target inflates every model's RMS on it, learned and prior alike.
+    self._sum_a = 0.0
+    self._sq_a = 0.0
     self.buckets = defaultdict(lambda: {"n": 0, "learned": 0.0, "prior": 0.0})
 
   def reset(self) -> None:
@@ -139,6 +146,8 @@ class _Scorer:
     self.n += 1
     self._sq_learned += (a - pred_learned) ** 2
     self._sq_prior += (a - pred_prior) ** 2
+    self._sum_a += a
+    self._sq_a += a * a
 
     i = _bucket_index(s.v_ego, SPEED_BUCKET_EDGES)
     if i >= 0:
@@ -151,6 +160,12 @@ class _Scorer:
     sq = self._sq_learned if which == "learned" else self._sq_prior
     return math.sqrt(sq / self.n) if self.n else float("nan")
 
+  def target_sigma(self) -> float:
+    """Spread of the target actually scored, for comparing across candidate targets."""
+    if self.n < 2:
+      return float("nan")
+    return math.sqrt(max(self._sq_a / self.n - (self._sum_a / self.n) ** 2, 0.0))
+
   def bucket_rms(self, i: int, which: str) -> tuple[float, int]:
     b = self.buckets[i]
     n = b["n"]
@@ -158,14 +173,15 @@ class _Scorer:
 
 
 def _ground_truth_lat_accel(v_ego: float, yaw_rate: float | None, roll: float,
-                             steering_angle_deg: float, steer_ratio: float, wheelbase: float) -> float:
+                             steering_angle_deg: float, steer_ratio: float, wheelbase: float,
+                             target: str = DEFAULT_TARGET) -> float:
   """What the car actually did, independent of either model under test.
 
   Yaw rate when available, the same kinematic fallback ``steering_learner.py`` uses
   otherwise - fixed against the platform's own ``CarParams.steerRatio``, not either model's
   fitted one, so the ground truth does not itself depend on which model is being scored.
 
-  The roll term follows ``APPLY_ROLL_COMPENSATION``, because the target scored against has
+  The roll term follows ``target``, because the target scored against has
   to be the target fitted. This subtracted roll unconditionally until the compensation was
   turned off in the learner and this tool was not moved with it, which scored both models
   against a target neither was fitted on. That is not a penalty applied evenly to both: road
@@ -178,11 +194,13 @@ def _ground_truth_lat_accel(v_ego: float, yaw_rate: float | None, roll: float,
   """
   a = yaw_rate * v_ego if yaw_rate is not None else (
     math.radians(steering_angle_deg) / (steer_ratio * wheelbase) * v_ego ** 2)
-  return a - math.sin(roll) * 9.81 if APPLY_ROLL_COMPENSATION else a
+  comp = math.sin(roll) * 9.81
+  return float({"raw": a, "roll": a - comp, "roll_flipped": a + comp}[target])
 
 
 def compare_route(route: str, split: float, learner: HondaSteeringLearner | None,
-                   scorer: _Scorer, verbose: bool = False) -> tuple[HondaSteeringLearner, HondaSteeringModel]:
+                   scorer: _Scorer, verbose: bool = False,
+                   target: str = DEFAULT_TARGET) -> tuple[HondaSteeringLearner, HondaSteeringModel]:
   """Fit ``learner`` causally over the first ``split`` fraction of a route, freeze its model
   there, and score the frozen model plus the prior on every steady-state sample after it."""
   from openpilot.selfdrive.locationd.helpers import Pose, PoseCalibrator
@@ -199,7 +217,8 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
 
   CP = None
   CC = None
-  torque = 0.0
+  torque_raw = 0.0
+  torque_can = 0.0
   calibrator = PoseCalibrator()
   yaw_rate = None
   yaw_rate_t = 0.0
@@ -214,7 +233,7 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
       CP = msg.carParams
       if not str(CP.carFingerprint).startswith(("HONDA", "ACURA")):
         raise ValueError(f"{route}: not a Honda ({CP.carFingerprint})")
-      learner = learner or HondaSteeringLearner(CP, dt=DT)
+      learner = learner or HondaSteeringLearner(CP, dt=DT, target=target)
     elif which == "extrinsicsCalibration":
       calibrator.feed_extrinsics_calibration(msg.extrinsicsCalibration)
     elif which == "vehicleParameters":
@@ -227,7 +246,8 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
       else:
         yaw_rate = None
     elif which == "carOutput":
-      torque = msg.carOutput.actuatorsOutput.torque
+      torque_raw = msg.carOutput.actuatorsOutput.torque
+      torque_can = msg.carOutput.actuatorsOutput.torqueOutputCan
     elif which == "carControl":
       CC = msg.carControl
     elif which == "carState" and learner is not None and CC is not None:
@@ -236,6 +256,9 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
         continue
       CS = msg.carState
       t = msg.logMonoTime * 1e-9
+      # normalized here rather than at carOutput: CP is only known once carParams has been
+      # seen, and this branch cannot run before that
+      torque = normalized_command(torque_raw, torque_can, CP)
 
       sample = HondaSteerSample(
         t=t - t0, v_ego=CS.vEgo, torque_cmd=torque, steering_angle_deg=CS.steeringAngleDeg,
@@ -255,7 +278,7 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
         else:
           scorer.update_rate(sample.steering_rate_deg)
           a = _ground_truth_lat_accel(sample.v_ego, yaw_rate, roll, sample.steering_angle_deg,
-                                      learner.prior.steer_ratio, learner.wheelbase)
+                                      learner.prior.steer_ratio, learner.wheelbase, target)
           if abs(a) <= MAX_LAT_ACCEL:
             scorer.score(sample, a, frozen, learner.prior)
 
@@ -274,9 +297,15 @@ def describe(scorer: _Scorer, frozen: HondaSteeringModel) -> str:
   verdict = "NO HELD-OUT DATA" if scorer.n == 0 else (
     f"learned {'BEATS' if learned_rms < prior_rms else 'LOSES TO'} prior by "
     f"{abs(1 - learned_rms / prior_rms) * 100:.0f}%" if prior_rms else "prior RMS is zero")
-  lines = [f"held-out RMS lat accel error: learned {learned_rms:.3f} m/s^2  "
-           f"prior {prior_rms:.3f} m/s^2  n={scorer.n}  [{verdict}]  "
-           f"(froze {'valid' if frozen.valid else 'NOT CONVERGED'} @ {frozen.points} pts)"]
+  sigma = scorer.target_sigma()
+  headline = (f"held-out RMS lat accel error: learned {learned_rms:.3f} m/s^2  "
+              f"prior {prior_rms:.3f} m/s^2  n={scorer.n}  [{verdict}]  "
+              f"(froze {'valid' if frozen.valid else 'NOT CONVERGED'} @ {frozen.points} pts)")
+  # RMS is not comparable across targets - each has its own variance - so normalize by it
+  normalized = (f"  target sigma {sigma:.3f} m/s^2   normalized: learned {learned_rms / sigma:.3f}  "
+                f"prior {prior_rms / sigma:.3f}  (RMS/sigma, <1 beats predicting the mean; "
+                f"this is the number to compare across --target)")
+  lines = [headline, normalized]
   for i, center in enumerate(speed_bucket_centres()):
     lr, n = scorer.bucket_rms(i, "learned")
     pr, _ = scorer.bucket_rms(i, "prior")
@@ -294,6 +323,9 @@ def main() -> int:
                  help="fraction of each platform's combined routes to fit on before freezing "
                       "and scoring the rest (default 0.5)")
   p.add_argument("--table", action="store_true", help="one line per platform")
+  p.add_argument("--target", choices=TARGETS, default=DEFAULT_TARGET,
+                 help="which lateral acceleration target to fit and score against "
+                      f"(default {DEFAULT_TARGET})")
   p.add_argument("-v", "--verbose", action="store_true")
   args = p.parse_args()
 
@@ -319,7 +351,8 @@ def main() -> int:
       try:
         # routes for one platform share a learner and a scorer: the split applies across
         # the platform's whole route set, not each route individually
-        learner, frozen = compare_route(route, args.split, learner, scorer, args.verbose)
+        learner, frozen = compare_route(route, args.split, learner, scorer, args.verbose,
+                                        args.target)
       except Exception as e:  # one bad route must not sink the sweep
         print(f"{car}: {route}: {e}", file=sys.stderr)
     if learner is None or frozen is None:

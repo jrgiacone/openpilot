@@ -23,7 +23,12 @@ import json
 import sys
 from collections import defaultdict
 
-from opendbc.car.honda.steering_learner import HondaSteeringLearner, HondaSteerSample, prior_from_car_params
+from opendbc.car.honda.steering_learner import (
+  HondaSteeringLearner,
+  HondaSteerSample,
+  normalized_command,
+  prior_from_car_params,
+)
 from opendbc.car.honda.values import CAR as HONDA
 from opendbc.car.tests.routes import routes as CAR_TEST_ROUTES
 from openpilot.tools.lib.logreader import LogReader
@@ -57,8 +62,9 @@ def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose
 
   lr = LogReader(route, sort_by_time=True)
 
-  CS = CC = None
-  torque = 0.0
+  CS = CC = CP = None
+  torque_raw = 0.0
+  torque_can = 0.0
   calibrator = PoseCalibrator()
   yaw_rate = None
   yaw_rate_t = 0.0
@@ -69,11 +75,15 @@ def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose
 
   for msg in lr:
     which = msg.which()
-    if which == "carParams" and learner is None:
+    # CP is captured on every route, not just the one that builds the learner: a pooled run
+    # hands the same learner to later routes, and normalized_command needs each route's own
+    # torque scale to read its commands
+    if which == "carParams":
       CP = msg.carParams
       if not str(CP.carFingerprint).startswith(("HONDA", "ACURA")):
         raise ValueError(f"{route}: not a Honda ({CP.carFingerprint})")
-      learner = HondaSteeringLearner(CP, dt=DT)
+      if learner is None:
+        learner = HondaSteeringLearner(CP, dt=DT)
     elif which == "extrinsicsCalibration":
       calibrator.feed_extrinsics_calibration(msg.extrinsicsCalibration)
     elif which == "deviceMotion":
@@ -89,7 +99,8 @@ def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose
     elif which == "vehicleParameters":
       roll = msg.vehicleParameters.roll
     elif which == "carOutput":
-      torque = msg.carOutput.actuatorsOutput.torque
+      torque_raw = msg.carOutput.actuatorsOutput.torque
+      torque_can = msg.carOutput.actuatorsOutput.torqueOutputCan
     elif which == "carControl":
       CC = msg.carControl
     elif which == "carState" and learner is not None and CC is not None:
@@ -99,6 +110,7 @@ def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose
       CS = msg.carState
       t = msg.logMonoTime * 1e-9
       t0 = t if t0 is None else t0
+      torque = normalized_command(torque_raw, torque_can, CP)
       learner.update(HondaSteerSample(
         t=t - t0,
         v_ego=CS.vEgo,

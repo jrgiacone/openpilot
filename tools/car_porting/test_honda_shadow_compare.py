@@ -96,9 +96,18 @@ class TestShadowCompare(unittest.TestCase):
     assert a_kinematic == expected
 
 
-  def test_ground_truth_removes_road_roll(self):
-    flat = _ground_truth_lat_accel(v_ego=20.0, yaw_rate=0.1, roll=0.0, steering_angle_deg=0.0,
-                                   steer_ratio=15.0, wheelbase=2.7)
-    banked = _ground_truth_lat_accel(v_ego=20.0, yaw_rate=0.1, roll=0.05, steering_angle_deg=0.0,
-                                     steer_ratio=15.0, wheelbase=2.7)
-    assert banked < flat
+  def test_the_roll_term_follows_the_target(self):
+    """Each target must move the scored truth the way its own name says.
+
+    This asserted `banked < flat` unconditionally, which stopped being true when the roll
+    compensation was turned off and the test was left failing rather than updated. The
+    point it was making is real, so it is made per target instead of globally.
+    """
+    def truth(roll, target):
+      return _ground_truth_lat_accel(v_ego=20.0, yaw_rate=0.1, roll=roll, steering_angle_deg=0.0,
+                                     steer_ratio=15.0, wheelbase=2.7, target=target)
+
+    for target, expected in (("raw", 0.0), ("roll", -math.sin(0.05) * 9.81),
+                             ("roll_flipped", math.sin(0.05) * 9.81)):
+      with self.subTest(target=target):
+        assert abs((truth(0.05, target) - truth(0.0, target)) - expected) < 1e-9
