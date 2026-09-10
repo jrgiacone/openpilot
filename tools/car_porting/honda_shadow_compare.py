@@ -249,11 +249,17 @@ def compare_route(route: str, learner: HondaSteeringLearner | None,
 
   Two ways to choose the freeze point:
 
-  * ``split`` - a fraction of *this route's* duration. Each route freezes again at its own
-    split, so the model being scored is always one that has seen most of the preceding
-    routes. That makes it a fine A/B harness and a useless convergence curve: sweeping
-    ``--split`` from 0.05 to 0.5 over seven routes moved the point count at freeze only
-    from 160146 to 181043.
+  * ``split`` - a fraction of the *first* route's duration. A stage freezes once and keeps
+    that model for every later route; it does **not** re-freeze per route, whatever the
+    fraction is nominally of. That makes it a fine A/B harness and a useless convergence
+    curve: sweeping ``--split`` from 0.05 to 0.5 over seven routes moved the point count at
+    freeze only from 160146 to 181043.
+
+    The corollary is a trap worth stating, because it silently produced a null result:
+    **whatever happens on the first route decides what is scored.** Comparing a change that
+    only bites after some event - a gain reset, say - against a route order whose first
+    route never has that event gives two byte-identical runs and no warning. Order a route
+    that exercises the change first.
   * ``freeze_points`` - freeze once, globally, the first time the learner reaches this many
     points, and keep that model for every later route. This is the one that answers "how
     much data does the learner need before it beats the prior", because the point count at
