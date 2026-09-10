@@ -2368,6 +2368,18 @@ struct HondaSteeringParameters @0xb0fdb62307de867f {
   resets @17 :UInt16;
   asymmetryLearned @18 :Bool;
 
+  # ``resets`` sums three unrelated events, which made it unreadable as a health signal.
+  # A gain reset discards a whole fit and is the only one that means something is wrong.
+  # A term reset zeroes one railed column of a fit whose gain is still sound, and a steer
+  # ratio reset is the separate kinematic fit, which feeds nothing. Over seven drives of one
+  # Civic the split is 12 gain / 63 term / 0 steer ratio: the term resets are the asymmetry
+  # column railing at its +-0.8 bound, and every gain reset tripped at 0.17-0.20 - grazing
+  # K_MIN_VALID from above, at 8-17 m/s - rather than diverging. Neither is instability, and
+  # the combined number could not show that.
+  gainResets @28 :UInt16;
+  termResets @29 :UInt16;
+  steerRatioResets @30 :UInt16;
+
   # Evidence about the roll compensation rather than about the car. Road roll is removed
   # from the fitted lateral acceleration as sin(roll)*9.81, and on gentle lane keeping
   # that estimate is not small next to the signal: on route 729a2e65b1f6201d its standard

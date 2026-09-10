@@ -31,7 +31,7 @@ from opendbc.car.honda.steering_learner import (
 )
 from opendbc.car.honda.values import CAR as HONDA
 from opendbc.car.tests.routes import routes as CAR_TEST_ROUTES
-from openpilot.tools.lib.logreader import LogReader
+from openpilot.tools.lib.logreader import LogReader, _LogFileReader
 
 # hondasteerd feeds the learner every other carState, so the rate the model is actually
 # fit at on the car is 50 Hz, not the 100 Hz carState is logged at. Replaying every
@@ -56,11 +56,30 @@ def honda_routes() -> dict[str, list[str]]:
   return dict(out)
 
 
-def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose: bool = False):
-  """Feed one route to a learner, creating one from the route's own carParams if needed."""
+def iter_route(route: str):
+  """Every message of ``route`` in time order, one segment held in memory at a time.
+
+  ``LogReader`` caches each decoded segment in ``MultiLogIterator.__lrs`` and never drops
+  it, so iterating a 29 segment route holds all 29 decoded at once, and pooling several
+  routes holds every segment of every route. That reached 12.7 GB on a 7 route pool and
+  OOM'd the machine; the routes that "failed" with an empty error message were MemoryError.
+  Sorting is per segment, which is all ``sort_by_time`` does here anyway - segments do not
+  overlap in time.
+  """
+  for ident in LogReader(route).logreader_identifiers:
+    yield from _LogFileReader(ident, sort_by_time=True)
+
+
+def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose: bool = False,
+                on_reset=None):
+  """Feed one route to a learner, creating one from the route's own carParams if needed.
+
+  ``on_reset`` is attached to the learner this creates, so a caller that does not build the
+  learner itself can still see every divergence reset - see ``honda_learner_audit.py``.
+  """
   from openpilot.selfdrive.locationd.helpers import Pose, PoseCalibrator
 
-  lr = LogReader(route, sort_by_time=True)
+  lr = iter_route(route)
 
   CS = CC = CP = None
   torque_raw = 0.0
@@ -84,6 +103,7 @@ def learn_route(route: str, learner: HondaSteeringLearner | None = None, verbose
         raise ValueError(f"{route}: not a Honda ({CP.carFingerprint})")
       if learner is None:
         learner = HondaSteeringLearner(CP, dt=DT)
+        learner.on_reset = on_reset
     elif which == "extrinsicsCalibration":
       calibrator.feed_extrinsics_calibration(msg.extrinsicsCalibration)
     elif which == "deviceMotion":
@@ -179,7 +199,7 @@ def main() -> int:
         # gets covered, which is exactly what the bucket gating is waiting for
         learner = learn_route(route, learner, args.verbose)
       except Exception as e:  # noqa: BLE001 - one bad route must not sink the sweep
-        print(f"{car}: {route}: {e}", file=sys.stderr)
+        print(f"{car}: {route}: {type(e).__name__}: {e}", file=sys.stderr)
     if learner is None:
       continue
 

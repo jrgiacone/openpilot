@@ -172,6 +172,22 @@ class _Scorer:
     return (math.sqrt(b[which] / n) if n else float("nan")), n
 
 
+def iter_route(route: str):
+  """Every message of ``route`` in time order, one segment held in memory at a time.
+
+  ``LogReader`` caches each decoded segment in ``MultiLogIterator.__lrs`` and never drops
+  it, so iterating a 29 segment route holds all 29 decoded at once, and pooling several
+  routes holds every segment of every route. That reached 12.7 GB on a 7 route pool and
+  OOM'd the machine; the routes that "failed" with an empty error message were MemoryError.
+  Sorting is per segment, which is all ``sort_by_time`` does here anyway - segments do not
+  overlap in time.
+  """
+  from openpilot.tools.lib.logreader import LogReader, _LogFileReader
+
+  for ident in LogReader(route).logreader_identifiers:
+    yield from _LogFileReader(ident, sort_by_time=True)
+
+
 def _ground_truth_lat_accel(v_ego: float, yaw_rate: float | None, roll: float,
                              steering_angle_deg: float, steer_ratio: float, wheelbase: float,
                              target: str = DEFAULT_TARGET) -> float:
@@ -200,20 +216,42 @@ def _ground_truth_lat_accel(v_ego: float, yaw_rate: float | None, roll: float,
 
 def compare_route(route: str, split: float, learner: HondaSteeringLearner | None,
                    scorer: _Scorer, verbose: bool = False,
-                   target: str = DEFAULT_TARGET) -> tuple[HondaSteeringLearner, HondaSteeringModel]:
-  """Fit ``learner`` causally over the first ``split`` fraction of a route, freeze its model
-  there, and score the frozen model plus the prior on every steady-state sample after it."""
+                   target: str = DEFAULT_TARGET, freeze_points: int | None = None,
+                   frozen: HondaSteeringModel | None = None,
+                   ) -> tuple[HondaSteeringLearner, HondaSteeringModel | None]:
+  """Fit ``learner`` causally, freeze its model, and score it and the prior on what follows.
+
+  Two ways to choose the freeze point:
+
+  * ``split`` - a fraction of *this route's* duration. Each route freezes again at its own
+    split, so the model being scored is always one that has seen most of the preceding
+    routes. That makes it a fine A/B harness and a useless convergence curve: sweeping
+    ``--split`` from 0.05 to 0.5 over seven routes moved the point count at freeze only
+    from 160146 to 181043.
+  * ``freeze_points`` - freeze once, globally, the first time the learner reaches this many
+    points, and keep that model for every later route. This is the one that answers "how
+    much data does the learner need before it beats the prior", because the point count at
+    freeze is the independent variable rather than an accident of route ordering.
+  """
   from openpilot.selfdrive.locationd.helpers import Pose, PoseCalibrator
-  from openpilot.tools.lib.logreader import LogReader
 
-  lr = LogReader(route, sort_by_time=True)
-  msgs = list(lr)
-
-  times = [m.logMonoTime * 1e-9 for m in msgs if m.which() == "carState"]
-  if not times:
-    raise ValueError(f"{route}: no carState")
-  t0, t1 = times[0], times[-1]
-  split_t = t0 + split * (t1 - t0)
+  # Two streaming passes rather than one materialized one. The split point needs the *last*
+  # carState time, which is only known at the end of the route, and collecting every message
+  # to get it held the whole decoded route in memory: 3.7 GB on route 00000012 alone, and
+  # 11 GB part way through a 7 route pool - enough to OOM a 14 GB machine. The first pass
+  # keeps two floats. Re-reading costs decode time only; the segment files are already on
+  # disk from the first pass.
+  split_t = None
+  if freeze_points is None:
+    t0 = t1 = None
+    for m in iter_route(route):
+      if m.which() == "carState":
+        t = m.logMonoTime * 1e-9
+        t0 = t if t0 is None else t0
+        t1 = t
+    if t0 is None:
+      raise ValueError(f"{route}: no carState")
+    split_t = t0 + split * (t1 - t0)
 
   CP = None
   CC = None
@@ -223,11 +261,11 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
   yaw_rate = None
   yaw_rate_t = 0.0
   roll = 0.0
-  frozen: HondaSteeringModel | None = None
   n_scored_before = scorer.n
+  route_t0 = None
   frame = 0
 
-  for msg in msgs:
+  for msg in iter_route(route):
     which = msg.which()
     if which == "carParams" and CP is None:
       CP = msg.carParams
@@ -256,19 +294,21 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
         continue
       CS = msg.carState
       t = msg.logMonoTime * 1e-9
+      route_t0 = t if route_t0 is None else route_t0
       # normalized here rather than at carOutput: CP is only known once carParams has been
       # seen, and this branch cannot run before that
       torque = normalized_command(torque_raw, torque_can, CP)
 
       sample = HondaSteerSample(
-        t=t - t0, v_ego=CS.vEgo, torque_cmd=torque, steering_angle_deg=CS.steeringAngleDeg,
+        t=t - route_t0, v_ego=CS.vEgo, torque_cmd=torque, steering_angle_deg=CS.steeringAngleDeg,
         steering_rate_deg=CS.steeringRateDeg, driver_torque=CS.steeringTorque,
         lat_active=CC.latActive, steering_pressed=CS.steeringPressed,
         saturated=abs(torque) > 0.99, yaw_rate=yaw_rate, roll=roll,
         lat_accel_valid=yaw_rate is not None and (t - yaw_rate_t) <= MAX_YAW_AGE,
       )
 
-      if frozen is None and t >= split_t:
+      if frozen is None and (learner.points >= freeze_points if freeze_points is not None
+                             else t >= split_t):
         frozen = learner.model()
 
       if frozen is not None:
@@ -284,7 +324,7 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
 
       learner.update(sample)
 
-  if frozen is None:
+  if frozen is None and freeze_points is None:
     raise ValueError(f"{route}: never reached the split point")
   if verbose:
     print(f"  {route}: froze at {frozen.points} pts (valid={frozen.valid}), "
@@ -322,6 +362,10 @@ def main() -> int:
   p.add_argument("--split", type=float, default=0.5,
                  help="fraction of each platform's combined routes to fit on before freezing "
                       "and scoring the rest (default 0.5)")
+  p.add_argument("--freeze-points", type=int, default=None,
+                 help="freeze the model once, globally, at this many learner points and "
+                      "score every sample after it. Use this for a convergence curve; "
+                      "--split cannot produce one (see compare_route)")
   p.add_argument("--table", action="store_true", help="one line per platform")
   p.add_argument("--target", choices=TARGETS, default=DEFAULT_TARGET,
                  help="which lateral acceleration target to fit and score against "
@@ -352,9 +396,9 @@ def main() -> int:
         # routes for one platform share a learner and a scorer: the split applies across
         # the platform's whole route set, not each route individually
         learner, frozen = compare_route(route, args.split, learner, scorer, args.verbose,
-                                        args.target)
+                                        args.target, args.freeze_points, frozen)
       except Exception as e:  # one bad route must not sink the sweep
-        print(f"{car}: {route}: {e}", file=sys.stderr)
+        print(f"{car}: {route}: {type(e).__name__}: {e}", file=sys.stderr)
     if learner is None or frozen is None:
       continue
 

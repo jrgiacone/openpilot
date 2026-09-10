@@ -19,25 +19,40 @@ model's own structure:
      ``responseTau`` reads 0. ``lagd.py`` already publishes ``lateralDelay`` on every car.
      This prints them side by side.
 
+  3. **What are the ``resets``?** ``--replay`` runs the route through a real learner and
+     logs every divergence reset with which fit and which term tripped it. The published
+     counter sums three unrelated events - a full gain reset, a railed secondary term, and
+     a railed steer ratio - and only the first is a failure signal. The same pass prints
+     each speed bucket's occupancy against ``MIN_POINTS_PER_BUCKET``, which says whether a
+     bucket's published gain is its own fit or the steady fit it falls back to.
+
 Also reports the learner's own published output over the drive (resets, divergence, delay)
 next to ``vehicleParameters.steerRatio``, the independent reference in the same log.
 
 Usage::
 
   ./honda_learner_audit.py 729a2e65b1f6201d/00000012--48f682b2ff
+  ./honda_learner_audit.py --replay 729a2e65b1f6201d/00000012--48f682b2ff
 """
 
 import argparse
 import sys
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 
+from openpilot.common.constants import CV
+
 from opendbc.car.honda.steering_learner import (
+  LAT_ACCEL_BUCKET_EDGES,
+  MAX_DELAY,
   MAX_LAT_ACCEL,
   MIN_LEARN_SPEED,
+  MIN_POINTS_PER_BUCKET,
   SPEED_BUCKET_EDGES,
   normalized_command,
+  speed_bucket_centres,
 )
 
 # hondasteerd feeds the learner every other carState, so the rate the model is actually fit
@@ -49,6 +64,9 @@ DT = 0.01 * DECIMATION
 YAW_SIGN = -1.0
 MAX_YAW_AGE = 0.1
 G = 9.81
+# selfdrive/locationd/lagd.py MIN_VEGO, spelled the same way it is there - lagd ignores
+# everything slower, which is the first thing to check when its validBlocks never leaves 1
+LAGD_MIN_VEGO = 50.0 * CV.MPH_TO_MS
 
 
 def collect(route: str) -> dict:
@@ -67,6 +85,7 @@ def collect(route: str) -> dict:
   frame = 0
 
   u, a_raw, rolls, vs = [], [], [], []
+  lagd_eligible = [0]
   lagd = {"delay": None, "valid_blocks": 0}
   ref_steer_ratio = None
   published = []
@@ -90,6 +109,7 @@ def collect(route: str) -> dict:
       published.append({
         "t": t, "actuator_delay": p.actuatorDelay, "effective_lag": p.effectiveLag,
         "response_tau": p.responseTau, "delay_learned": p.delayLearned,
+        "delay_railed": p.delayRailed,
         "resets": p.resets, "diverged": p.diverged, "steer_ratio": p.steerRatio,
         "points": p.points, "valid": p.valid,
       })
@@ -122,11 +142,16 @@ def collect(route: str) -> dict:
       a_raw.append(yaw_rate * CS.vEgo)
       rolls.append(roll)
       vs.append(CS.vEgo)
+      # lagd only accumulates blocks above MIN_VEGO (22.35 m/s), so the reason it reports
+      # a default 0.300 s here may simply be that this drive has no highway in it
+      if CS.vEgo >= LAGD_MIN_VEGO:
+        lagd_eligible[0] += 1
 
   return {
     "route": route, "CP": CP, "u": np.array(u), "a_raw": np.array(a_raw),
     "roll": np.array(rolls), "v": np.array(vs), "lagd": lagd,
     "ref_steer_ratio": ref_steer_ratio, "published": published,
+    "lagd_eligible_s": lagd_eligible[0] * DT,
     "torque_can_seen": torque_can,
   }
 
@@ -172,12 +197,17 @@ def report(d: dict) -> None:
   prior_delay = float(d["CP"].steerActuatorDelay) if d["CP"] else float("nan")
   print(f"\n  delay   lagd {lagd['delay'] if lagd['delay'] is not None else float('nan'):.3f} s "
         f"(validBlocks {lagd['valid_blocks']})   CP.steerActuatorDelay {prior_delay:.3f} s")
+  print(f"          lat_active time above lagd's MIN_VEGO ({LAGD_MIN_VEGO:.1f} m/s): "
+        f"{d['lagd_eligible_s']:.0f} s of {len(u) * DT:.0f} s gated")
   pub = d["published"]
   if pub:
     last = pub[-1]
     print(f"          bank actuatorDelay {last['actuator_delay']:.3f} s   "
           f"responseTau {last['response_tau']:.3f} s   effectiveLag {last['effective_lag']:.3f} s   "
-          f"delayLearned {last['delay_learned']}")
+          f"delayLearned {last['delay_learned']}   delayRailed {last['delay_railed']} "
+          f"(grid tops out at MAX_DELAY {MAX_DELAY:.3f} s)")
+    railed_n = sum(1 for p in pub if p["delay_railed"])
+    print(f"          delayRailed on {railed_n}/{len(pub)} publishes")
     if lagd["delay"] is not None:
       print(f"          |bank - lagd| = {abs(last['actuator_delay'] - lagd['delay']):.3f} s   "
             f"|effectiveLag - lagd| = {abs(last['effective_lag'] - lagd['delay']):.3f} s")
@@ -195,9 +225,86 @@ def report(d: dict) -> None:
     print("          no hondaSteeringParameters in this log (daemon not running this branch)")
 
 
+def _speed_labels() -> list[str]:
+  edges = list(SPEED_BUCKET_EDGES)
+  return [f"{edges[i]:.0f}-{edges[i+1]:.0f}" if edges[i + 1] < 100 else f"{edges[i]:.0f}+"
+          for i in range(len(edges) - 1)]
+
+
+def replay_report(route: str) -> dict:
+  """Run the route through a real learner and report what reset, and where the points went.
+
+  The published ``hondaSteeringParameters`` only carries counts, and a count cannot
+  distinguish a gain reset from a railed offset. This is the pass that can.
+  """
+  # tools/car_porting is not a package and is not mirrored under openpilot/, so the
+  # sibling module is imported by path, the same way test_honda_shadow_compare.py does it
+  sys.path.insert(0, str(Path(__file__).resolve().parent))
+  from learn_honda_steering import learn_route
+
+  events: list = []
+  learner = learn_route(route, on_reset=events.append)
+  model = learner.model()
+
+  print(f"\n{'-' * 100}\n  RESETS   {route}\n{'-' * 100}")
+  by_kind: dict[str, int] = defaultdict(int)
+  for e in events:
+    by_kind[e.kind] += 1
+  print(f"  gain {by_kind['gain']}   term {by_kind['term']}   steer_ratio {by_kind['steer_ratio']}"
+        f"   (published resets {learner.resets})")
+
+  if events:
+    print(f"\n  {'t [s]':>8} {'v_ego':>7} {'kind':>11} {'fit':>11} {'term':>11} "
+          f"{'value':>10} {'points':>8}")
+    for e in events:
+      print(f"  {e.t:8.1f} {e.v_ego:7.1f} {e.kind:>11} {e.fit:>11} {e.term:>11} "
+            f"{e.value:10.3f} {e.points:8d}")
+
+    # a term that always rails at the same bound is the bound acting as a prior, not a
+    # fit wandering: report where each one landed relative to its range
+    print(f"\n  {'term':>11} {'n':>5} {'min':>10} {'max':>10} {'mean':>10}")
+    per_term: dict[str, list] = defaultdict(list)
+    for e in events:
+      per_term[e.term].append(e.value)
+    for term, vals in sorted(per_term.items()):
+      print(f"  {term:>11} {len(vals):5d} {min(vals):10.3f} {max(vals):10.3f} "
+            f"{float(np.mean(vals)):10.3f}")
+
+  # -- where the points actually went, per speed bucket -------------------------------
+  counts = np.asarray(learner.bucket_counts)
+  labels = _speed_labels()
+  a_edges = list(LAT_ACCEL_BUCKET_EDGES)
+  a_labels = [f"{a_edges[i]:+.1f}" for i in range(len(a_edges) - 1)]
+  print(f"\n{'-' * 100}\n  BUCKET OCCUPANCY   (cell needs {MIN_POINTS_PER_BUCKET} points; a "
+        f"bucket needs 2 filled cells + excitation)\n{'-' * 100}")
+  print(f"  {'speed':>8} {'centre':>7} {'total':>8} {'cells>=min':>11} {'own fit?':>9}   "
+        + "  ".join(a.rjust(7) for a in a_labels))
+  centres = speed_bucket_centres()
+  own_fit = []
+  for i, label in enumerate(labels):
+    row = counts[i]
+    filled = int((row >= MIN_POINTS_PER_BUCKET).sum())
+    gain = learner._bucket_gain(i)
+    own_fit.append(gain is not None)
+    print(f"  {label:>8} {centres[i]:7.1f} {int(row.sum()):8d} {filled:11d} "
+          f"{('yes' if gain is not None else 'NO -> steady'):>9}   "
+          + "  ".join(f"{int(c):7d}" for c in row))
+  print("\n  published latAccelFactorV: "
+        + "  ".join(f"{v:.3f}@{bp:.0f}" for bp, v in
+                    zip(model.lat_accel_factor_bp, model.lat_accel_factor_v, strict=True)))
+  print(f"  learned_buckets {model.learned_buckets}   points {model.points}   "
+        f"valid {model.valid}")
+
+  return {"route": route, "events": events, "counts": counts, "own_fit": own_fit,
+          "model": model, "learner": learner}
+
+
 def main() -> int:
   p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("route", nargs="+")
+  p.add_argument("--replay", action="store_true",
+                 help="also run each route through a real learner and report resets and "
+                      "bucket occupancy (slower: this refits the whole drive)")
   args = p.parse_args()
 
   summary = defaultdict(list)
@@ -210,8 +317,11 @@ def main() -> int:
         for name, tgt in (("raw", d["a_raw"]), ("a - g*sin(roll)", d["a_raw"] - comp),
                           ("a + g*sin(roll)", d["a_raw"] + comp)):
           summary[name].append(_corr(d["u"], tgt))
+      if args.replay:
+        d = None
+        replay_report(route)
     except Exception as e:
-      print(f"{route}: {e}", file=sys.stderr)
+      print(f"{route}: {type(e).__name__}: {e}", file=sys.stderr)
 
   if len(args.route) > 1 and summary:
     print(f"\n{'=' * 100}\nACROSS ROUTES: mean corr(u, target)\n{'=' * 100}")
