@@ -260,6 +260,15 @@ def compare_route(route: str, learner: HondaSteeringLearner | None,
     only bites after some event - a gain reset, say - against a route order whose first
     route never has that event gives two byte-identical runs and no warning. Order a route
     that exercises the change first.
+
+    This changed silently in `221115603`, which moved `frozen` from a local in this
+    function onto the shared stage: before it, every route re-froze at its own split and
+    only its own second half was scored. That is why pooled numbers recorded before
+    2026-09-10 do not match new ones - the same 7 route pool at split 0.5 reads
+    n=110395, normalized 0.900 under the old semantics and n=189473, normalized 0.928
+    under these (both measured 2026-09-10, route 00000012 first). Neither is wrong; they
+    hold out different sets. Do not compare across the boundary.
+
   * ``freeze_points`` - freeze once, globally, the first time the learner reaches this many
     points, and keep that model for every later route. This is the one that answers "how
     much data does the learner need before it beats the prior", because the point count at

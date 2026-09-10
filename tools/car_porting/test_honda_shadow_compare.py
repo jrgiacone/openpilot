@@ -1,8 +1,12 @@
 import math
+from types import SimpleNamespace
+from unittest import mock
 import sys
 import unittest
 from pathlib import Path
 
+from opendbc.car.honda.values import CAR as HONDA
+from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.steering_learner import RACK_MOTION_DEADBAND, HondaSteeringModel, HondaSteerSample, _smooth_sign
 
 # tools/car_porting is not a package and is not mirrored under openpilot/, so the sibling
@@ -11,7 +15,8 @@ from opendbc.car.honda.steering_learner import RACK_MOTION_DEADBAND, HondaSteeri
 # with `python -m unittest` from this directory or
 # `tools/test_runner.py tools/car_porting/test_honda_shadow_compare.py`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from honda_shadow_compare import _Scorer, _ground_truth_lat_accel
+import honda_shadow_compare
+from honda_shadow_compare import DT, _Scorer, _Stage, _ground_truth_lat_accel, compare_route
 
 
 def _drive_scorer(scorer: _Scorer, model: HondaSteeringModel, scored_against: HondaSteeringModel,
@@ -111,3 +116,84 @@ class TestShadowCompare(unittest.TestCase):
                              ("roll_flipped", math.sin(0.05) * 9.81)):
       with self.subTest(target=target):
         assert abs((truth(0.05, target) - truth(0.0, target)) - expected) < 1e-9
+
+
+class _XYZ:
+  """Duck type of ``DeviceMotion.XYZMeasurement``, which is all ``Measurement`` reads."""
+  def __init__(self, x=0.0, y=0.0, z=0.0):
+    self.x, self.y, self.z = x, y, z
+    self.xStd = self.yStd = self.zStd = 0.0
+
+
+def _synthetic_route(CP, seconds: float, v: float, amp: float, t0: float = 100.0, dt: float = 0.01):
+  """A fake route: the messages ``compare_route`` reads, duck typed rather than capnp.
+
+  Only the fields the tool touches exist. The yaw rate is generated from a fixed gain so
+  every sample is eligible and the learner's point count grows at a predictable rate,
+  which is what the freeze-order assertions below are about.
+  """
+  t = t0
+  yield SimpleNamespace(which=lambda: "carParams", logMonoTime=int(t * 1e9), carParams=CP)
+  i = 0
+  while t < t0 + seconds:
+    u = amp * math.sin(2 * math.pi * (t - t0) / 7.0)
+    a = 2.0 * u
+    # YAW_SIGN is -1: the calibrated frame is z-down, the command is positive-left
+    yaw = SimpleNamespace(angularVelocityDevice=_XYZ(z=-a / v), orientationNED=_XYZ(),
+                          velocityDevice=_XYZ(), accelerationDevice=_XYZ(),
+                          inputsOK=True, sensorsOK=True)
+    yaw.angularVelocityDevice.valid = True
+    yaw.orientationNED.valid = True
+    yield SimpleNamespace(which=lambda: "deviceMotion", logMonoTime=int(t * 1e9), deviceMotion=yaw)
+    yield SimpleNamespace(which=lambda: "carOutput", logMonoTime=int(t * 1e9),
+                          carOutput=SimpleNamespace(actuatorsOutput=SimpleNamespace(
+                            torque=u, torqueOutputCan=-u * float(CP.lateralParams.torqueV[-1]))))
+    yield SimpleNamespace(which=lambda: "carControl", logMonoTime=int(t * 1e9),
+                          carControl=SimpleNamespace(latActive=True))
+    yield SimpleNamespace(which=lambda: "carState", logMonoTime=int(t * 1e9),
+                          carState=SimpleNamespace(vEgo=v, steeringAngleDeg=0.0, steeringRateDeg=0.0,
+                                                   steeringTorque=0.0, steeringPressed=False))
+    i += 1
+    t += dt
+
+
+class TestFreezeOrder(unittest.TestCase):
+  """The methodology trap, pinned.
+
+  ``--split`` freezes the model **once**, during the *first* route, and scores every later
+  route against that one frozen model. So the route order on the command line decides both
+  when the freeze happens and which samples are held out. An experiment whose effect only
+  shows up after some event - a gain reset, say - is invisible if the first route never has
+  that event. These tests fail if that ever silently changes.
+  """
+
+  def _run(self, routes):
+    CP = CarInterface.get_non_essential_params(next(iter(HONDA)))
+    data = {name: (secs, v, amp) for name, secs, v, amp in routes}
+    stage = _Stage(None, _Scorer(DT), split=0.5)
+    learner = None
+    with mock.patch.object(honda_shadow_compare, "iter_route",
+                           lambda r: _synthetic_route(CP, *data[r])):
+      for name in data:
+        learner = compare_route(name, learner, [stage], False, "raw")
+    return stage, learner
+
+  def test_the_freeze_happens_during_the_first_route(self):
+    routes = [("a", 40.0, 22.0, 0.3), ("b", 40.0, 22.0, 0.3)]
+    stage, learner = self._run(routes)
+    assert stage.frozen is not None
+    # frozen part way through route "a", not at the end of the pool
+    assert 0 < stage.frozen.points < learner.points / 2 + 1
+    assert stage.scorer.n > 0
+
+  def test_swapping_route_order_changes_the_held_out_set(self):
+    """Two routes of different length: whichever goes first sets the freeze time, so the
+    scored sample count moves. This is why any experiment about reset behaviour must put a
+    reset-heavy route first."""
+    short = ("a", 20.0, 22.0, 0.3)
+    long = ("b", 60.0, 22.0, 0.3)
+    first_short, _ = self._run([short, long])
+    first_long, _ = self._run([long, short])
+    assert first_short.scorer.n != first_long.scorer.n
+    # the shorter first route freezes earlier, so more of the pool is held out
+    assert first_short.scorer.n > first_long.scorer.n
