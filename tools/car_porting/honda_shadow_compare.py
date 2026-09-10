@@ -458,6 +458,31 @@ def describe(scorer: _Scorer, frozen: HondaSteeringModel) -> str:
   return "\n".join(lines)
 
 
+def freeze_table(stages: list["_Stage"]) -> str:
+  """Per-bucket gains and held-out counts at every freeze point, on one pass.
+
+  The steady gain is not settled at 80 000 points - the covariance-based relative std
+  reads 0.050 at 40k and the 8 m/s gain then moves 1.36 -> 0.56 by 80k. Prose cannot say
+  which bucket is doing the wandering, so print the schedule against the freeze point and
+  read it off. Each row is one frozen model: its gain per bucket, and how many held-out
+  samples that bucket got.
+  """
+  centres = speed_bucket_centres()
+  head = "  ".join(f"{c:>13.0f} m/s" for c in centres)
+  lines = [f"{'freeze':>10} {'valid':>6}  {head}"]
+  for st in stages:
+    if st.frozen is None:
+      continue
+    vs = st.frozen.lat_accel_factor_v or []
+    cells = []
+    for i in range(len(centres)):
+      g = vs[i] if i < len(vs) else float("nan")
+      _, n = st.scorer.bucket_rms(i, "learned")
+      cells.append(f"{g:>8.3f} (n={n:>6d})")
+    lines.append(f"{st.frozen.points:>10d} {str(st.frozen.valid):>6}  " + "  ".join(cells))
+  return "\n".join(lines)
+
+
 def main() -> int:
   p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("route", nargs="*", help="route name(s), e.g. 729a2e65b1f6201d/00000011--a13bdcf90d")
@@ -517,6 +542,10 @@ def main() -> int:
         print(f"{label:<26} {describe(st.scorer, st.frozen)}")
       else:
         print(f"\n{label}\n  {describe(st.scorer, st.frozen)}")
+
+    if len(stages) > 1 and any(st.frozen is not None for st in stages):
+      print("\nper bucket, by freeze point:")
+      print(freeze_table(stages))
 
   return 0 if any_scored else 1
 

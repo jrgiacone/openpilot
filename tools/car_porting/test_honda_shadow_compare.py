@@ -18,7 +18,7 @@ from opendbc.car.honda.steering_learner import RACK_MOTION_DEADBAND, HondaSteeri
 # `tools/test_runner.py tools/car_porting/test_honda_shadow_compare.py`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import honda_shadow_compare
-from honda_shadow_compare import DT, _Scorer, _Stage, _ground_truth_lat_accel, compare_route
+from honda_shadow_compare import DT, _Scorer, _Stage, _ground_truth_lat_accel, compare_route, freeze_table
 
 
 def _drive_scorer(scorer: _Scorer, model: HondaSteeringModel, scored_against: HondaSteeringModel,
@@ -210,3 +210,15 @@ class TestFreezeOrder(unittest.TestCase):
     assert "zero gain resets" in err.getvalue()
     # only the route the freeze happened on is warned about, once
     assert err.getvalue().count("WARNING") == 1
+
+
+class TestFreezeTable(unittest.TestCase):
+  def test_one_row_per_frozen_stage(self):
+    """The convergence table is the readout for "which bucket is still wandering", so it
+    must carry every freeze point that produced a model, and skip the ones that did not."""
+    frozen = HondaSteeringModel(lat_accel_factor_bp=[8.0, 35.0], lat_accel_factor_v=[2.4, 2.4],
+                                points=1234, valid=True)
+    stages = [_Stage(1000, _Scorer(DT), frozen=frozen), _Stage(999999, _Scorer(DT))]
+    table = freeze_table(stages)
+    assert len([ln for ln in table.splitlines() if ln.strip()]) == 2  # header + one row
+    assert "1234" in table
