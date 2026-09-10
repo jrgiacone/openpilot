@@ -37,12 +37,18 @@ Examples::
 
   # fit on the first quarter, score the rest - a harsher test of early convergence
   ./honda_shadow_compare.py --all --split 0.25 --table
+
+  # several splits, or several freeze points, swept on a single pass over the data.
+  # Both take a list, so give the routes *first* or argparse reads them as more values:
+  ./honda_shadow_compare.py ROUTE_A ROUTE_B --split 0.5 0.25
+  ./honda_shadow_compare.py ROUTE_A ROUTE_B --freeze-points 600 5000 40000
 """
 
 import argparse
 import math
 import sys
 from collections import defaultdict, deque
+from dataclasses import dataclass
 
 from opendbc.car.honda.steering_learner import (
   DEFAULT_TARGET,
@@ -214,11 +220,31 @@ def _ground_truth_lat_accel(v_ego: float, yaw_rate: float | None, roll: float,
   return float({"raw": a, "roll": a - comp, "roll_flipped": a + comp}[target])
 
 
-def compare_route(route: str, split: float, learner: HondaSteeringLearner | None,
-                   scorer: _Scorer, verbose: bool = False,
-                   target: str = DEFAULT_TARGET, freeze_points: int | None = None,
-                   frozen: HondaSteeringModel | None = None,
-                   ) -> tuple[HondaSteeringLearner, HondaSteeringModel | None]:
+@dataclass
+class _Stage:
+  """One freeze threshold, the model frozen at it, and the scorer holding it out.
+
+  A convergence curve wants several thresholds over the *same* data. Running the tool once
+  per threshold re-decodes every segment each time - about ten minutes per pooled pass over
+  seven routes - so a list of these rides along on one pass instead: each stage freezes its
+  own copy of the model when the learner reaches its own threshold, and scores every sample
+  after that into its own scorer. The stages are independent; sharing the pass costs only
+  the extra ``model()`` calls.
+  """
+  freeze_points: int | None  # None: freeze at ``split`` through the route instead
+  scorer: _Scorer
+  split: float = 0.5
+  frozen: HondaSteeringModel | None = None
+
+  @property
+  def label(self) -> str:
+    return f"@{self.freeze_points}pts" if self.freeze_points is not None else f"@split{self.split:g}"
+
+
+def compare_route(route: str, learner: HondaSteeringLearner | None,
+                   stages: list[_Stage], verbose: bool = False,
+                   target: str = DEFAULT_TARGET,
+                   ) -> HondaSteeringLearner:
   """Fit ``learner`` causally, freeze its model, and score it and the prior on what follows.
 
   Two ways to choose the freeze point:
@@ -232,6 +258,9 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
     points, and keep that model for every later route. This is the one that answers "how
     much data does the learner need before it beats the prior", because the point count at
     freeze is the independent variable rather than an accident of route ordering.
+
+  Each element of ``stages`` picks one of the two, and they are advanced together over a
+  single pass of the route.
   """
   from openpilot.selfdrive.locationd.helpers import Pose, PoseCalibrator
 
@@ -241,8 +270,8 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
   # 11 GB part way through a 7 route pool - enough to OOM a 14 GB machine. The first pass
   # keeps two floats. Re-reading costs decode time only; the segment files are already on
   # disk from the first pass.
-  split_t = None
-  if freeze_points is None:
+  split_t: dict[int, float] = {}
+  if any(st.freeze_points is None for st in stages):
     t0 = t1 = None
     for m in iter_route(route):
       if m.which() == "carState":
@@ -251,7 +280,8 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
         t1 = t
     if t0 is None:
       raise ValueError(f"{route}: no carState")
-    split_t = t0 + split * (t1 - t0)
+    # several split fractions ride along on the same pass, each with its own freeze time
+    split_t = {id(st): t0 + st.split * (t1 - t0) for st in stages if st.freeze_points is None}
 
   CP = None
   CC = None
@@ -261,7 +291,7 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
   yaw_rate = None
   yaw_rate_t = 0.0
   roll = 0.0
-  n_scored_before = scorer.n
+  n_scored_before = [st.scorer.n for st in stages]
   route_t0 = None
   frame = 0
 
@@ -307,29 +337,76 @@ def compare_route(route: str, split: float, learner: HondaSteeringLearner | None
         lat_accel_valid=yaw_rate is not None and (t - yaw_rate_t) <= MAX_YAW_AGE,
       )
 
-      if frozen is None and (learner.points >= freeze_points if freeze_points is not None
-                             else t >= split_t):
-        frozen = learner.model()
+      # the ground truth does not depend on which stage is scoring, so compute it once
+      eligible = (sample.lat_active and not sample.steering_pressed and sample.lat_accel_valid
+                  and sample.v_ego >= MIN_LEARN_SPEED)
+      a = _ground_truth_lat_accel(sample.v_ego, yaw_rate, roll, sample.steering_angle_deg,
+                                  learner.prior.steer_ratio, learner.wheelbase,
+                                  target) if eligible else 0.0
 
-      if frozen is not None:
-        if not sample.lat_active or sample.steering_pressed or not sample.lat_accel_valid \
-           or sample.v_ego < MIN_LEARN_SPEED:
-          scorer.reset()
+      for st in stages:
+        if st.frozen is None and (learner.points >= st.freeze_points
+                                  if st.freeze_points is not None
+                                  else t >= split_t[id(st)]):
+          st.frozen = learner.model()
+        if st.frozen is None:
+          continue
+        if not eligible:
+          st.scorer.reset()
         else:
-          scorer.update_rate(sample.steering_rate_deg)
-          a = _ground_truth_lat_accel(sample.v_ego, yaw_rate, roll, sample.steering_angle_deg,
-                                      learner.prior.steer_ratio, learner.wheelbase, target)
+          st.scorer.update_rate(sample.steering_rate_deg)
           if abs(a) <= MAX_LAT_ACCEL:
-            scorer.score(sample, a, frozen, learner.prior)
+            st.scorer.score(sample, a, st.frozen, learner.prior)
 
       learner.update(sample)
 
-  if frozen is None and freeze_points is None:
-    raise ValueError(f"{route}: never reached the split point")
+  for st in stages:
+    if st.frozen is None and st.freeze_points is None:
+      raise ValueError(f"{route}: never reached the split point")
   if verbose:
-    print(f"  {route}: froze at {frozen.points} pts (valid={frozen.valid}), "
-          f"{scorer.n - n_scored_before} held-out samples scored", file=sys.stderr)
-  return learner, frozen
+    for st, before in zip(stages, n_scored_before, strict=True):
+      if st.frozen is not None:
+        print(f"  {route} {st.label}: froze at {st.frozen.points} pts "
+              f"(valid={st.frozen.valid}), {st.scorer.n - before} held-out samples scored",
+              file=sys.stderr)
+  return learner
+
+
+def _rel_std(cov, gain: float) -> float:
+  """Standard error of a fit's gain column as a fraction of the gain itself.
+
+  ``covariance`` is already serialised on every published model, so a gate built on this
+  needs no new state and survives a resume - unlike a drift measure, which would need its
+  own EMA and a ``MODEL_VERSION`` bump. ``FORGETTING_FACTOR`` and ``P_MAX_SCALE`` put a
+  floor and a ceiling under P, so this reads as *current* information about the gain rather
+  than everything the fit has ever seen, which is the right thing for "has it settled".
+  """
+  try:
+    var = float(cov[0][0])
+  except (TypeError, IndexError, KeyError):
+    return float("nan")
+  if not (var >= 0.0) or not gain:
+    return float("nan")
+  return math.sqrt(var) / abs(gain)
+
+
+def _settledness(m: HondaSteeringModel) -> str:
+  """How settled the published gains are, next to the schedule they produced."""
+  cov = m.covariance if isinstance(m.covariance, dict) else {}
+  vs = m.lat_accel_factor_v or []
+  # the steady fit is what every bucket without its own answer falls back to, so score it
+  # against the schedule at the reference speed the prior is quoted at
+  steady = _rel_std(cov.get("steady"), m.lat_accel_factor(20.0))
+  schedule = f"    schedule {[round(v, 3) for v in vs]}  learned_buckets {m.learned_buckets}  points {m.points}"
+  out = [schedule, f"    rel std of steady gain {steady:.4f}   per bucket:"]
+  per = []
+  speed_cov = cov.get("speed") or []
+  for i, center in enumerate(speed_bucket_centres()):
+    c = speed_cov[i] if i < len(speed_cov) else None
+    g = vs[i] if i < len(vs) else 0.0
+    per.append(f"~{center:.0f} m/s {_rel_std(c, g):.4f}")
+  out[-1] += " " + "  ".join(per)
+  return "\n".join(out)
 
 
 def describe(scorer: _Scorer, frozen: HondaSteeringModel) -> str:
@@ -345,7 +422,7 @@ def describe(scorer: _Scorer, frozen: HondaSteeringModel) -> str:
   normalized = (f"  target sigma {sigma:.3f} m/s^2   normalized: learned {learned_rms / sigma:.3f}  "
                 f"prior {prior_rms / sigma:.3f}  (RMS/sigma, <1 beats predicting the mean; "
                 f"this is the number to compare across --target)")
-  lines = [headline, normalized]
+  lines = [headline, normalized, _settledness(frozen)]
   for i, center in enumerate(speed_bucket_centres()):
     lr, n = scorer.bucket_rms(i, "learned")
     pr, _ = scorer.bucket_rms(i, "prior")
@@ -359,13 +436,15 @@ def main() -> int:
   p.add_argument("route", nargs="*", help="route name(s), e.g. 729a2e65b1f6201d/00000011--a13bdcf90d")
   p.add_argument("--all", action="store_true", help="every Honda route in opendbc/car/tests/routes.py")
   p.add_argument("--car", action="append", help="limit --all to these platforms")
-  p.add_argument("--split", type=float, default=0.5,
+  p.add_argument("--split", type=float, nargs="+", default=[0.5], metavar="F",
                  help="fraction of each platform's combined routes to fit on before freezing "
-                      "and scoring the rest (default 0.5)")
-  p.add_argument("--freeze-points", type=int, default=None,
+                      "and scoring the rest (default 0.5). Several values are swept together "
+                      "on a single pass over the data")
+  p.add_argument("--freeze-points", type=int, nargs="+", default=None, metavar="N",
                  help="freeze the model once, globally, at this many learner points and "
                       "score every sample after it. Use this for a convergence curve; "
-                      "--split cannot produce one (see compare_route)")
+                      "--split cannot produce one (see compare_route). Several values are "
+                      "swept together on a single pass over the data")
   p.add_argument("--table", action="store_true", help="one line per platform")
   p.add_argument("--target", choices=TARGETS, default=DEFAULT_TARGET,
                  help="which lateral acceleration target to fit and score against "
@@ -373,7 +452,7 @@ def main() -> int:
   p.add_argument("-v", "--verbose", action="store_true")
   args = p.parse_args()
 
-  if not 0.0 < args.split < 1.0:
+  if any(not 0.0 < f < 1.0 for f in args.split):
     p.error("--split must be between 0 and 1")
 
   jobs: dict[str, list[str]] = {}
@@ -389,25 +468,28 @@ def main() -> int:
   any_scored = False
   for car, routes in sorted(jobs.items()):
     learner = None
-    scorer = _Scorer(DT)
-    frozen = None
+    stages = ([_Stage(n, _Scorer(DT)) for n in args.freeze_points] if args.freeze_points
+              else [_Stage(None, _Scorer(DT), split=f) for f in args.split])
     for route in routes:
       try:
-        # routes for one platform share a learner and a scorer: the split applies across
-        # the platform's whole route set, not each route individually
-        learner, frozen = compare_route(route, args.split, learner, scorer, args.verbose,
-                                        args.target, args.freeze_points, frozen)
+        # routes for one platform share a learner and their scorers: the split applies
+        # across the platform's whole route set, not each route individually
+        learner = compare_route(route, learner, stages, args.verbose, args.target)
       except Exception as e:  # one bad route must not sink the sweep
         print(f"{car}: {route}: {type(e).__name__}: {e}", file=sys.stderr)
-    if learner is None or frozen is None:
+    if learner is None:
       continue
 
-    any_scored = True
-    label = frozen.fingerprint or car
-    if args.table:
-      print(f"{label:<26} {describe(scorer, frozen)}")
-    else:
-      print(f"\n{label}\n  {describe(scorer, frozen)}")
+    for st in stages:
+      if st.frozen is None:
+        print(f"{car}: never reached {st.freeze_points} points", file=sys.stderr)
+        continue
+      any_scored = True
+      label = f"{st.frozen.fingerprint or car} {st.label}"
+      if args.table:
+        print(f"{label:<26} {describe(st.scorer, st.frozen)}")
+      else:
+        print(f"\n{label}\n  {describe(st.scorer, st.frozen)}")
 
   return 0 if any_scored else 1
 

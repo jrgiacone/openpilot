@@ -299,12 +299,193 @@ def replay_report(route: str) -> dict:
           "model": model, "learner": learner}
 
 
+def lagd_report(route: str) -> dict:
+  """Replay openpilot's own ``LateralLagEstimator`` over a route and say which gate stops it.
+
+  Routes 00000012 and 00000030 both spend over 200 s above lagd's ``MIN_VEGO`` yet publish
+  ``validBlocks 1``, so speed alone does not explain why the delay estimate never converges.
+  The published message carries only the outcome, and the deliverable here is the *reason*:
+  every sample rejected by ``update_points`` is attributed to whichever of its gates was
+  false, and every early return from ``update_estimate`` to the check that took it.
+
+  This settles whether the learner's delay bank could ever be retired in favour of lagd.
+  """
+  sys.path.insert(0, str(Path(__file__).resolve().parent))
+  from learn_honda_steering import iter_route
+
+  from openpilot.cereal.services import SERVICE_LIST
+  from openpilot.selfdrive.locationd.lagd import (
+    MIN_LAT_ACCEL_RANGE,
+    MAX_YAW_RATE_SANITY_CHECK,
+    SMOOTH_K,
+    SMOOTH_SIGMA,
+    MIN_LAG,
+    MAX_LAG,
+    LateralLagEstimator,
+    masked_symmetric_moving_average,
+  )
+
+  class _Attributed(LateralLagEstimator):
+    """The estimator, unchanged, with every rejection recorded.
+
+    ``update_points`` builds its gates as locals, so they are recomputed here from the
+    estimator's own public attributes rather than intercepted. ``update_estimate`` is
+    mirrored rather than wrapped: calling ``super()`` and then re-deriving why it returned
+    would run the cross-correlation twice on every call.
+    """
+
+    def __init__(self, *a, **kw):
+      super().__init__(*a, **kw)
+      self.point_gates: dict[str, int] = defaultdict(int)
+      self.estimate_gates: dict[str, int] = defaultdict(int)
+      self.n_points = 0
+      self.n_estimates = 0
+      self.accepted_lags: list[float] = []
+
+    def update_points(self):
+      self.n_points += 1
+      la_desired = self.desired_curvature * self.v_ego * self.v_ego
+      la_actual = self.yaw_rate * self.v_ego
+      gates = {
+        "fast": self.v_ego > self.min_vego,
+        "turning": abs(self.yaw_rate) >= self.min_yr,
+        "sensors_valid": bool(self.pose_valid and abs(self.yaw_rate) < MAX_YAW_RATE_SANITY_CHECK
+                              and self.yaw_rate_std < MAX_YAW_RATE_SANITY_CHECK),
+        "la_valid": bool(abs(la_actual) <= self.max_lat_accel
+                         and abs(la_desired - la_actual) <= self.max_lat_accel_diff),
+        "calib_valid": bool(self.calibrator.calib_valid),
+        "lat_active": bool(self.lat_active),
+        "not_steering_pressed": not self.steering_pressed,
+        "not_steering_saturated": not self.steering_saturated,
+      }
+      # has_recovered is a function of the four "last bad" timestamps *after* this sample
+      # has updated them, so apply those updates here first. They are idempotent, so the
+      # super() call below repeats them and arrives at the same answer.
+      if not self.lat_active:
+        self.last_lat_inactive_t = self.t
+      if self.steering_pressed:
+        self.last_steering_pressed_t = self.t
+      if self.steering_saturated:
+        self.last_steering_saturated_t = self.t
+      if not gates["sensors_valid"] or not gates["la_valid"]:
+        self.last_pose_invalid_t = self.t
+      gates["has_recovered"] = all(
+        self.t - last_t >= self.min_recovery_buffer_sec
+        for last_t in (self.last_lat_inactive_t, self.last_steering_pressed_t,
+                       self.last_steering_saturated_t, self.last_pose_invalid_t))
+      super().update_points()
+      for name, ok in gates.items():
+        if not ok:
+          self.point_gates[name] += 1
+      if all(gates.values()):
+        self.point_gates["okay"] += 1
+
+    def update_estimate(self):
+      self.n_estimates += 1
+      if not self.points_enough():
+        self.estimate_gates["points_enough"] += 1
+        return
+
+      times, desired, actual, okay = self.points.get()
+      if not self.points_valid():
+        self.estimate_gates["points_valid"] += 1
+        return
+      if actual.max() - actual.min() < MIN_LAT_ACCEL_RANGE:
+        self.estimate_gates["lat_accel_range"] += 1
+        return
+      if self.last_estimate_t != 0 and times[0] <= self.last_estimate_t:
+        start = next(-i for i, t in enumerate(reversed(times)) if t <= self.last_estimate_t)
+        if start == 0 or not np.any(okay[start:]):
+          self.estimate_gates["no_new_okay_points"] += 1
+          return
+
+      desired = masked_symmetric_moving_average(desired, okay, SMOOTH_K, SMOOTH_SIGMA)
+      actual = masked_symmetric_moving_average(actual, okay, SMOOTH_K, SMOOTH_SIGMA)
+      delay, corr, confidence = self.actuator_delay(desired, actual, okay, self.dt, MIN_LAG, MAX_LAG)
+      if corr < self.min_ncc:
+        self.estimate_gates["corr_below_min_ncc"] += 1
+        return
+      if confidence < self.min_confidence:
+        self.estimate_gates["confidence_below_min"] += 1
+        return
+
+      self.block_avg.update(delay)
+      self.last_estimate_t = self.t
+      self.estimate_gates["accepted"] += 1
+      self.accepted_lags.append(float(delay))
+
+  dt = 1.0 / SERVICE_LIST["deviceMotion"].frequency
+  est = None
+  frame = 0
+  t_above_min_vego = 0.0
+  last_cs_t = None
+  status = valid_blocks = None
+
+  for msg in iter_route(route):
+    which = msg.which()
+    if which == "carParams" and est is None:
+      est = _Attributed(msg.carParams, dt)
+      continue
+    if est is None:
+      continue
+    t = msg.logMonoTime * 1e-9
+    if which == "carState":
+      # qlogs have no controlsState, and without desiredCurvature the estimator can only
+      # ever report "no lateral accel range" - refuse to produce a misleading table
+      if last_cs_t is not None and msg.carState.vEgo > est.min_vego:
+        t_above_min_vego += t - last_cs_t
+      last_cs_t = t
+    if which in LateralLagEstimator.inputs:
+      est.handle_log(t, which, getattr(msg, which))
+    if which == "deviceMotion":
+      est.update_points()
+      frame += 1
+      if frame % 5 == 0:
+        est.update_estimate()
+        m = est.get_msg(True).lateralDelay
+        status, valid_blocks = str(m.status), m.validBlocks
+
+  if est is None:
+    raise ValueError(f"{route}: no carParams in log")
+  if not est.n_estimates:
+    raise ValueError(f"{route}: no deviceMotion - is this a qlog? --lagd needs rlogs")
+
+  print(f"\n{'-' * 100}\n  LAGD REPLAY   {route}\n{'-' * 100}")
+  print(f"  initial lag {est.initial_lag:.3f}s   final status {status}   "
+        f"validBlocks {valid_blocks}   accepted estimates {len(est.accepted_lags)}")
+  if est.accepted_lags:
+    print(f"  accepted lag: mean {np.mean(est.accepted_lags):.3f}s  "
+          f"std {np.std(est.accepted_lags):.3f}s  "
+          f"min {min(est.accepted_lags):.3f}s  max {max(est.accepted_lags):.3f}s")
+  print(f"  time above lagd MIN_VEGO ({est.min_vego:.1f} m/s): {t_above_min_vego:.0f}s")
+
+  print(f"\n  update_points: {est.n_points} samples, {est.point_gates['okay']} okay")
+  print(f"  {'gate':>24} {'n false':>9} {'% of samples':>13}")
+  for name, n in sorted(est.point_gates.items(), key=lambda kv: -kv[1]):
+    if name == "okay":
+      continue
+    print(f"  {name:>24} {n:9d} {100.0 * n / est.n_points:12.1f}%")
+
+  print(f"\n  update_estimate: {est.n_estimates} calls")
+  print(f"  {'returned because':>24} {'n':>9} {'% of calls':>13}")
+  for name, n in sorted(est.estimate_gates.items(), key=lambda kv: -kv[1]):
+    print(f"  {name:>24} {n:9d} {100.0 * n / est.n_estimates:12.1f}%")
+
+  return {"route": route, "valid_blocks": valid_blocks, "status": status,
+          "accepted": est.accepted_lags, "point_gates": dict(est.point_gates),
+          "estimate_gates": dict(est.estimate_gates), "t_above_min_vego": t_above_min_vego}
+
+
 def main() -> int:
   p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("route", nargs="+")
   p.add_argument("--replay", action="store_true",
                  help="also run each route through a real learner and report resets and "
                       "bucket occupancy (slower: this refits the whole drive)")
+  p.add_argument("--lagd", action="store_true",
+                 help="also replay openpilot's LateralLagEstimator over each route and "
+                      "report which gate rejects each sample and each estimate. Needs "
+                      "rlogs: qlogs carry no controlsState")
   args = p.parse_args()
 
   summary = defaultdict(list)
@@ -320,6 +501,9 @@ def main() -> int:
       if args.replay:
         d = None
         replay_report(route)
+      if args.lagd:
+        d = None
+        lagd_report(route)
     except Exception as e:
       print(f"{route}: {type(e).__name__}: {e}", file=sys.stderr)
 
