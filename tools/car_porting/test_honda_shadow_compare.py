@@ -1,3 +1,5 @@
+import contextlib
+import io
 import math
 from types import SimpleNamespace
 from unittest import mock
@@ -197,3 +199,14 @@ class TestFreezeOrder(unittest.TestCase):
     assert first_short.scorer.n != first_long.scorer.n
     # the shorter first route freezes earlier, so more of the pool is held out
     assert first_short.scorer.n > first_long.scorer.n
+
+  def test_a_reset_free_first_route_warns(self):
+    """The trap has to be loud. A synthetic route never resets the gain, so freezing on it
+    must produce the warning that says the held-out score contains nothing about reset
+    behaviour."""
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+      self._run([("a", 40.0, 22.0, 0.3), ("b", 40.0, 22.0, 0.3)])
+    assert "zero gain resets" in err.getvalue()
+    # only the route the freeze happened on is warned about, once
+    assert err.getvalue().count("WARNING") == 1

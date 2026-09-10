@@ -307,6 +307,8 @@ def compare_route(route: str, learner: HondaSteeringLearner | None,
   yaw_rate_t = 0.0
   roll = 0.0
   n_scored_before = [st.scorer.n for st in stages]
+  froze_before = [st.frozen is not None for st in stages]
+  gain_resets_before = learner.gain_resets if learner is not None else 0
   route_t0 = None
   frame = 0
 
@@ -378,6 +380,16 @@ def compare_route(route: str, learner: HondaSteeringLearner | None,
   for st in stages:
     if st.frozen is None and st.freeze_points is None:
       raise ValueError(f"{route}: never reached the split point")
+  # The freeze is global and happens on one route, so that route decides what is held
+  # out. A change that only bites after a gain reset, scored against a first route that
+  # never resets, gives a byte-identical run and no warning - that has already produced a
+  # null result once. Say so rather than letting it pass silently.
+  if learner is not None and learner.gain_resets == gain_resets_before:
+    for st, before in zip(stages, froze_before, strict=True):
+      if not before and st.frozen is not None and st.freeze_points is None:
+        print(f"WARNING: {route} {st.label}: the model froze on a route with zero gain "
+              "resets, so nothing about reset or recovery behaviour is in the held-out "
+              "score. Put a reset-heavy route first.", file=sys.stderr)
   if verbose:
     for st, before in zip(stages, n_scored_before, strict=True):
       if st.frozen is not None:
